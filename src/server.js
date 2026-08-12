@@ -40,10 +40,18 @@ function fail(res, msg) {
   res.json({ returnCode: 'FAIL', msg });
 }
 
+// The expected signature goes to the server log only. Echoing it in the
+// response would hand any caller a valid signature for the exact payload
+// they just sent — a one-round-trip bypass of the whole scheme.
+function failSign(res, check) {
+  log('SIGN_ERROR', 'expected', check.expected, 'got', check.got);
+  res.json({ returnCode: 'FAIL', msg: 'SIGN_ERROR' });
+}
+
 app.post('/jetinno/getQrCode', async (req, res) => {
   log('getQrCode <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.getQrCodeRequest, APIKEY);
-  if (!check.ok) return fail(res, `SIGN_ERROR (expected ${check.expected})`);
+  if (!check.ok) return failSign(res, check);
 
   const { deviceNo, orderNo, orderAmount, notifyUrl, productId, productName } = flatten(req.body);
 
@@ -102,7 +110,7 @@ app.post('/jetinno/getQrCode', async (req, res) => {
 app.post('/jetinno/productdone', (req, res) => {
   log('productdone <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.productDoneRequest, APIKEY);
-  if (!check.ok) return fail(res, `SIGN_ERROR (expected ${check.expected})`);
+  if (!check.ok) return failSign(res, check);
 
   const { orderNo, isFinish } = flatten(req.body);
   const order = orders.get(orderNo);
@@ -114,7 +122,7 @@ app.post('/jetinno/productdone', (req, res) => {
 app.post('/jetinno/refund', (req, res) => {
   log('refund <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.refundRequest, APIKEY);
-  if (!check.ok) return fail(res, `SIGN_ERROR (expected ${check.expected})`);
+  if (!check.ok) return failSign(res, check);
   const { deviceNo, orderNo } = flatten(req.body);
   respond(res, { deviceNo, orderNo, refundState: 'ERROR' }, ['returnCode', 'msg', 'time', 'deviceNo', 'orderNo', 'refundState']);
 });
