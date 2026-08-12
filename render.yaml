@@ -1,0 +1,32 @@
+# Render Blueprint. Optional — the dashboard's "New Web Service" flow asks for
+# the same handful of fields and is harder to get wrong. See README.
+services:
+  - type: web
+    name: jetinno-qpay-bridge
+    runtime: node
+    # Singapore is the closest region to Mongolia. Jetinno's server gives this
+    # bridge an 8-second budget per request, so the round trip matters.
+    region: singapore
+    # NOT free: the free plan sleeps after 15 idle minutes and takes ~30s to
+    # wake, which blows the 8-second budget. A machine idle overnight would
+    # fail the first customer of the morning — the exact failure this service
+    # exists to avoid.
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # sync: false means Render prompts for the value and keeps it out of
+      # this file. Never commit a real credential here.
+      - key: QPAY_USERNAME
+        sync: false
+      - key: QPAY_PASSWORD
+        sync: false
+      - key: QPAY_INVOICE_CODE
+        sync: false
+      - key: JETINNO_USERNAME
+        sync: false
+      - key: JETINNO_APIKEY
+        sync: false
