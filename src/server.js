@@ -96,6 +96,10 @@ app.post('/jetinno/getQrCode', async (req, res) => {
       productId,
       invoiceId: invoice.invoiceId,
       qrCode,
+      // Kept for the Jetinno negotiation: qr_text is what bank apps scan,
+      // and its real length is the number we need the 128-char field raised
+      // to. Visible via GET /orders/:orderNo.
+      qrTextLen: invoice.qrText ? invoice.qrText.length : null,
       status: 'awaiting_payment',
       settling: false,
       createdAt: Date.now(),
