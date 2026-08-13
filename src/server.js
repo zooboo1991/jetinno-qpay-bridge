@@ -27,7 +27,16 @@ const ABANDON_AFTER_MS = Number(process.env.ABANDON_AFTER_MS ?? 10 * 60 * 1000);
 /** orderNo -> order. In memory on purpose: one machine, one process, first test. */
 const orders = new Map();
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+// Every log line is also kept in a ring buffer served at /recent, so the
+// machine installer can read the server's view from a phone browser on site
+// — no Render dashboard needed.
+const recent = [];
+const log = (...a) => {
+  const line = `${new Date().toISOString()} ${a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')}`;
+  console.log(line);
+  recent.push(line);
+  if (recent.length > 200) recent.shift();
+};
 
 function respond(res, data, signKeys) {
   const body = { returnCode: 'SUCCESS', msg: 'SUCCESS', time: timestamp(), data };
@@ -222,6 +231,24 @@ app.all('/qpay/callback/:orderNo', (req, res) => {
 app.get('/check/:orderNo', settleRoute);
 
 app.all('/mock/pay/:orderNo', settleRoute);
+
+// Debug endpoints are gated behind DEBUG_KEY: the log ring includes expected
+// signatures on SIGN_ERROR, and handing those out publicly would let anyone
+// forge a valid request in one round trip. No key configured — no endpoint.
+const DEBUG_KEY = process.env.DEBUG_KEY ?? '';
+const debugAllowed = (req) => DEBUG_KEY && req.query.key === DEBUG_KEY;
+
+// Server log, phone-readable on site: /recent?key=<DEBUG_KEY>
+app.get('/recent', (req, res) => {
+  if (!debugAllowed(req)) return res.status(404).end();
+  res.type('text/plain').send(recent.join('\n') || '(лог хоосон)');
+});
+
+// Every order this process has seen: /orders?key=<DEBUG_KEY>
+app.get('/orders', (req, res) => {
+  if (!debugAllowed(req)) return res.status(404).end();
+  res.json([...orders.entries()].map(([orderNo, o]) => ({ orderNo, ...o })));
+});
 
 // Read-only view of an order. Handy on site: after a machine goes quiet, this
 // says whether the bridge ever saw the order and what state it reached.
