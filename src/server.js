@@ -1,6 +1,8 @@
 import express from 'express';
 import { SIGNABLE, buildSign, verifySign, flatten, timestamp } from './sign.js';
 import * as qpay from './qpay.js';
+import * as db from './db.js';
+import * as store from './store.js';
 
 const app = express();
 /**
@@ -63,6 +65,42 @@ const log = (...a) => {
   recent.push(line);
   if (recent.length > 200) recent.shift();
 };
+
+/**
+ * Phase 2 dual-write (docs/multi-tenant-plan.md §6).
+ *
+ * Orders are written to Postgres as well as the Map, but the Map still answers
+ * every read and still gates every decision. That ordering is the whole point:
+ * a database that is slow, down, or wrong cannot cost a customer their coffee
+ * while we are still learning how it behaves under real traffic.
+ *
+ * Fire-and-forget, never awaited. The machine's 8-second budget must not grow
+ * by a database round trip for a write nothing reads yet — and the timing is
+ * logged either way, which is what this phase exists to measure.
+ */
+const DUAL_WRITE = db.configured();
+
+/** Identifies which process holds a settle lease. Render gives no stable id. */
+const INSTANCE = `${process.env.RENDER_INSTANCE_ID ?? 'local'}-${process.pid}`;
+
+function dw(label, fn) {
+  if (!DUAL_WRITE) return;
+  const started = Date.now();
+  Promise.resolve()
+    .then(fn)
+    .then(() => log('dw', label, `${Date.now() - started}ms`))
+    // Only the message: a pg error can carry the failing row, and that row is
+    // one schema change away from holding something that should not be logged.
+    .catch((err) => log('dw FAILED', label, `${Date.now() - started}ms`, err.message.split('\n')[0]));
+}
+
+/** Resolves an order's Postgres id without depending on when the insert landed. */
+async function pgOrderId(deviceNo, orderNo) {
+  const machine = await store.resolveMachine(deviceNo);
+  if (!machine) return null;
+  const row = await store.findOrderByMachine(machine.machine_id, orderNo);
+  return row?.id ?? null;
+}
 
 function respond(res, data, signKeys) {
   const body = { returnCode: 'SUCCESS', msg: 'SUCCESS', time: timestamp(), data };
@@ -129,6 +167,7 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
       orderAmount,
       notifyUrl,
       productId,
+      amountMnt: amount,
       invoiceId: invoice.invoiceId,
       qrCode,
       // Kept for the Jetinno negotiation: qr_text is what bank apps scan,
@@ -141,6 +180,46 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
     });
     log('getQrCode ->', orderNo, `${amount}₮`, qrCode);
     respond(res, { deviceNo, orderNo, qrCode }, SIGNABLE.getQrCodeResponse);
+
+    dw('beginOrder', async () => {
+      const machine = await store.resolveMachine(deviceNo);
+      if (!machine) {
+        // The machine is not registered yet — expected until it is seeded, and
+        // worth a row rather than a log line that rotates away, because after
+        // the cutover this is the case that stops a sale.
+        await store.logIngestError({
+          path: '/jetinno/getQrCode',
+          deviceNo,
+          orderNo,
+          reason: 'DEVICE_NOT_REGISTERED',
+        });
+        return;
+      }
+      const inserted = await store.beginOrder({
+        machineId: machine.machine_id,
+        ownerId: machine.owner_id,
+        credentialId: machine.qpay_credential_id,
+        orderNo,
+        deviceNo,
+        notifyUrl,
+        productId,
+        productName,
+        rawOrderAmount: String(orderAmount),
+        amountDivisor: AMOUNT_DIVISOR,
+        amountMnt: amount,
+        senderInvoiceNo: orderNo,
+        callbackUrl,
+        abandonAfterMs: ABANDON_AFTER_MS,
+      });
+      const id = inserted?.id ?? (await store.findOrderByMachine(machine.machine_id, orderNo))?.id;
+      if (id) {
+        await store.attachInvoice(id, {
+          invoiceId: invoice.invoiceId,
+          qrCode,
+          qrTextLen: invoice.qrText ? invoice.qrText.length : null,
+        });
+      }
+    });
   } catch (err) {
     // The detail goes to the log, not to the caller. err.message here can
     // carry up to 300 characters of a QPay response body, and this response
@@ -155,11 +234,16 @@ app.post('/jetinno/productdone', jetinnoBody, (req, res) => {
   const check = verifySign(req.body, SIGNABLE.productDoneRequest, APIKEY);
   if (!check.ok) return failSign(res, check);
 
-  const { orderNo, isFinish } = flatten(req.body);
+  const { deviceNo, orderNo, isFinish } = flatten(req.body);
   const order = orders.get(orderNo);
   if (order) order.finished = isFinish;
   log('productdone', orderNo, isFinish);
   res.json({ returnCode: 'SUCCESS', msg: 'SUCCESS' });
+
+  dw('productDone', async () => {
+    const id = await pgOrderId(deviceNo ?? order?.deviceNo, orderNo);
+    if (id) await store.recordProductDone(id, isFinish === 'SUCCESS');
+  });
 });
 
 app.post('/jetinno/refund', jetinnoBody, (req, res) => {
@@ -217,14 +301,42 @@ async function settle(orderNo) {
   order.settling = true;
   try {
     if (!MOCK) {
-      const { paid, paymentId } = await qpay.checkPayment(order.invoiceId);
+      const { paid, paymentId, amount } = await qpay.checkPayment(order.invoiceId);
       if (!paid) return { ok: false, reason: 'not paid yet' };
       order.paymentRef = paymentId;
+      order.paidAmount = amount;
+    } else {
+      // No QPay to ask, so the simulation pays exactly what was invoiced.
+      order.paidAmount = order.amountMnt;
     }
 
     const machineReply = await notifyMachine(orderNo, order);
     order.status = 'paid';
     order.paidAt = new Date().toISOString();
+
+    // Mirrored after the fact, not used as the gate. The Map's `settling` flag
+    // is still what stops a second coffee; app.claim_order_for_settle takes
+    // that job at the phase-3 cutover, once a day of these timings says the
+    // round trip fits inside Jetinno's budget.
+    // Each step returns the row it changed, or null for "declined". A step
+    // that declines and is ignored is not a guard: mark_payment_confirmed
+    // refusing a mismatched amount, followed by an unconditional
+    // finish_settle, is how the row reaches 'paid' with no confirmation
+    // behind it — which the orders_confirmed_shape constraint then rejects.
+    dw('settle', async () => {
+      const id = await pgOrderId(order.deviceNo, orderNo);
+      if (!id) return;
+      const claimed = await store.claimSettle(id, { leaseSeconds: 60, instance: INSTANCE });
+      if (!claimed) return log('dw settle declined', orderNo, 'claim');
+      const confirmed = await store.markPaymentConfirmed(id, {
+        paymentId: order.paymentRef ?? null,
+        paidAmountMnt: order.paidAmount ?? null,
+      });
+      if (!confirmed) return log('dw settle declined', orderNo, 'confirm');
+      if (!(await store.markNotifySent(id))) return log('dw settle declined', orderNo, 'notify');
+      if (!(await store.finishSettle(id))) return log('dw settle declined', orderNo, 'finish');
+    });
+
     return { ok: true, machineReply };
   } finally {
     order.settling = false;
@@ -361,6 +473,10 @@ async function sweepAbandoned() {
         await settle(orderNo);
       } else {
         log('sweep cancelled', orderNo);
+        dw('sweepCancel', async () => {
+          const id = await pgOrderId(order.deviceNo, orderNo);
+          if (id) await store.markCancelled(id);
+        });
       }
     } catch (err) {
       order.status = 'awaiting_payment';

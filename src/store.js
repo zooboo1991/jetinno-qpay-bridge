@@ -132,23 +132,33 @@ export async function claimSettle(orderId, { leaseSeconds, instance, notifyGrace
   return rows[0] ?? null;
 }
 
-export async function markPaymentConfirmed(orderId, { paymentId, paidAmountMnt, leaseSeconds }) {
-  await query(`select app.mark_payment_confirmed($1, $2, $3, $4)`, [
+/**
+ * Every state function below returns `setof public.orders`: the row it changed,
+ * or nothing at all when its own WHERE clause refused the transition. Each
+ * wrapper therefore returns the row or null, and callers are expected to stop
+ * on a null. Swallowing the empty result turns a deliberate refusal — a
+ * mismatched amount, a lost lease — into a silent no-op that the next step
+ * then builds on.
+ */
+const one = async (sql, params) => (await query(sql, params)).rows[0] ?? null;
+
+export const markPaymentConfirmed = (orderId, { paymentId, paidAmountMnt, leaseSeconds }) =>
+  one(`select * from app.mark_payment_confirmed($1, $2, $3, $4)`, [
     orderId,
     paymentId ?? null,
     paidAmountMnt ?? null,
     leaseSeconds ?? 60,
   ]);
-}
 
-export const markNotifySent = (orderId) => query(`select app.mark_notify_sent($1)`, [orderId]);
-export const finishSettle = (orderId) => query(`select app.finish_settle($1)`, [orderId]);
+export const markNotifySent = (orderId) => one(`select * from app.mark_notify_sent($1)`, [orderId]);
+export const finishSettle = (orderId) => one(`select * from app.finish_settle($1)`, [orderId]);
 export const releaseSettle = (orderId, error) =>
-  query(`select app.release_settle($1, $2)`, [orderId, error ?? null]);
-export const giveUp = (orderId, error) => query(`select app.give_up($1, $2)`, [orderId, error ?? null]);
-export const markCancelled = (orderId) => query(`select app.mark_cancelled($1)`, [orderId]);
+  one(`select * from app.release_settle($1, $2)`, [orderId, error ?? null]);
+export const giveUp = (orderId, error) =>
+  one(`select * from app.give_up($1, $2)`, [orderId, error ?? null]);
+export const markCancelled = (orderId) => one(`select * from app.mark_cancelled($1)`, [orderId]);
 export const recordProductDone = (orderId, ok) =>
-  query(`select app.record_product_done($1, $2)`, [orderId, ok]);
+  one(`select * from app.record_product_done($1, $2)`, [orderId, ok]);
 
 export async function claimAbandoned({ limit, leaseSeconds, instance } = {}) {
   const { rows } = await query(`select * from app.claim_abandoned_orders($1, $2, $3)`, [

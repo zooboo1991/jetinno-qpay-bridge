@@ -148,12 +148,33 @@ await check('a second claim while the lease is held is refused', async () => {
 });
 
 // ---- settle through to paid ---------------------------------------------
-await check('markPaymentConfirmed → markNotifySent → finishSettle reaches paid', async () => {
-  await store.markPaymentConfirmed(orderId, { paymentId: 'pay_1', paidAmountMnt: 100 });
-  await store.markNotifySent(orderId);
-  await store.finishSettle(orderId);
+// A refusal has to be visible to the caller. The wrapper returning nothing at
+// all let a wrong amount pass silently, and the next step then drove the row
+// to 'paid' with no confirmation behind it.
+await check('markPaymentConfirmed refuses a mismatched amount and says so', async () => {
+  const refused = await store.markPaymentConfirmed(orderId, {
+    paymentId: 'pay_wrong',
+    paidAmountMnt: 99,
+  });
   const row = await store.findOrderByMachine(machineId, orderNo);
-  return row.status === 'paid' && row.payment_confirmed_at !== null;
+  return refused === null && row.payment_confirmed_at === null && row.status === 'settling';
+});
+
+await check('markPaymentConfirmed → markNotifySent → finishSettle reaches paid', async () => {
+  const confirmed = await store.markPaymentConfirmed(orderId, {
+    paymentId: 'pay_1',
+    paidAmountMnt: 100,
+  });
+  const notified = await store.markNotifySent(orderId);
+  const finished = await store.finishSettle(orderId);
+  const row = await store.findOrderByMachine(machineId, orderNo);
+  return (
+    confirmed !== null &&
+    notified !== null &&
+    finished !== null &&
+    row.status === 'paid' &&
+    row.payment_confirmed_at !== null
+  );
 });
 
 await check('recordProductDone marks the cup as dispensed', async () => {

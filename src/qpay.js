@@ -137,7 +137,10 @@ export async function checkPayment(invoiceId) {
     amount: Number(r.payment_amount),
   }));
   const settled = rows.find((r) => SETTLED.has(r.status));
-  return { paid: Boolean(settled), paymentId: settled?.paymentId, rows };
+  // The amount comes back from QPay, not from our own record: the database
+  // refuses to confirm a payment whose amount differs from the invoice, and
+  // that check only means something if the two numbers have separate origins.
+  return { paid: Boolean(settled), paymentId: settled?.paymentId, amount: settled?.amount, rows };
 }
 
 /**
