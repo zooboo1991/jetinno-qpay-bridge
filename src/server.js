@@ -3,6 +3,7 @@ import { SIGNABLE, buildSign, verifySign, flatten, timestamp } from './sign.js';
 import * as qpay from './qpay.js';
 import * as db from './db.js';
 import * as store from './store.js';
+import { ownerApi, authConfigured } from './owner-api.js';
 
 const app = express();
 /**
@@ -377,6 +378,22 @@ app.get('/check/:orderNo', settleRoute);
 // from being a public free-coffee endpoint — so it should not exist at all in
 // a real deployment.
 if (MOCK) app.all('/mock/pay/:orderNo', settleRoute);
+
+/*
+ * The owner portal's API. Mounted only when both halves of what it needs are
+ * present: a Supabase project to verify tokens against, and a database to
+ * read. Missing either, the routes do not exist at all — a 404 is the honest
+ * answer, and it is a great deal safer than a router that authenticates
+ * nobody because one environment variable was forgotten on a new deploy.
+ *
+ * Its absence cannot affect a coffee: nothing on the machine path touches it.
+ */
+if (authConfigured() && DUAL_WRITE) {
+  app.use('/owner/v1', ownerApi({ log, portalOrigin: process.env.PORTAL_ORIGIN ?? '' }));
+  log('owner api mounted', process.env.PORTAL_ORIGIN ? `origin=${process.env.PORTAL_ORIGIN}` : 'origin=(unset)');
+} else {
+  log('owner api NOT mounted', `supabase=${authConfigured()} db=${DUAL_WRITE}`);
+}
 
 // Debug endpoints are gated behind DEBUG_KEY: the log ring includes expected
 // signatures on SIGN_ERROR, and handing those out publicly would let anyone

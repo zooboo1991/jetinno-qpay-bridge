@@ -201,3 +201,25 @@ export async function logIngestError({ path, deviceNo, orderNo, reason, payload,
     [path, deviceNo ?? null, orderNo ?? null, reason, payload ?? null, remoteIp ?? null]
   );
 }
+
+/**
+ * The businesses behind a set of owner ids, for the portal's account switcher.
+ *
+ * Takes the ids rather than a user id: the caller has already resolved
+ * membership from a verified token, and re-deriving it here would put a second
+ * copy of that rule in a second place, where the two can drift.
+ */
+export async function ownersByIds(ownerIds) {
+  if (!ownerIds?.length) return [];
+  const { rows } = await query(
+    `select o.id, o.name, o.status,
+            count(m.id) filter (where m.status = 'active')::int as active_machines
+       from public.owners o
+       left join public.machines m on m.owner_id = o.id
+      where o.id = any($1::uuid[])
+      group by o.id
+      order by o.name`,
+    [ownerIds]
+  );
+  return rows;
+}

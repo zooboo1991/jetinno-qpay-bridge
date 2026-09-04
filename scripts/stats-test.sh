@@ -14,10 +14,17 @@ cleanup
 docker run -d --rm --name "$NAME" -e POSTGRES_PASSWORD=test -e POSTGRES_DB=bridge \
   -p "$PORT:5432" postgres:16-alpine >/dev/null
 
-for _ in $(seq 1 40); do
-  docker exec "$NAME" pg_isready -U postgres -d bridge >/dev/null 2>&1 && break
+# pg_isready answers OK during the image's own initdb phase, on a temporary
+# server that is then shut down and restarted — so it is not a readiness
+# signal. Waiting on a real query is.
+ready=0
+for _ in $(seq 1 60); do
+  if docker exec "$NAME" psql -U postgres -d bridge -Atc 'select 1' >/dev/null 2>&1; then
+    ready=1; break
+  fi
   node -e "setTimeout(()=>{},1000)"
 done
+if [ "$ready" != "1" ]; then echo "  ✗ Postgres 60 секундэд бэлэн болсонгүй"; exit 1; fi
 
 # 000 is the local stub for what a real Supabase project already provides.
 for f in migrations/000_*.sql migrations/001_*.sql migrations/002_*.sql migrations/003_*.sql migrations/004_*.sql; do
