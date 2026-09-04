@@ -20,14 +20,18 @@ cleanup
 # a test identity, never a real deployment's.
 export JETINNO_USERNAME=testname
 export JETINNO_APIKEY=DBRW17YE7FHKR72T
+# The order-inspection endpoints are key-gated now, so the test authenticates
+# like an operator would.
+export DEBUG_KEY=e2e-debug-key
+DBG=(-H "X-Debug-Key: e2e-debug-key")
 
 PORT=$PORT QPAY_MOCK=1 PUBLIC_URL=$B node src/server.js > "$LOG/server.log" 2>&1 &
 curl -sf --retry-connrefused --retry 20 --retry-delay 1 "$B/health" > /dev/null
 
 echo "### 1. Машин кофе сонголоо (getQrCode)"
 BRIDGE_URL=$B TEST_ORDER_NO=$ORDER MACHINE_PORT=4000 node src/simulate-machine.js > "$LOG/machine.log" 2>&1 &
-curl -sf -o /dev/null --retry-all-errors --retry 30 --retry-delay 1 "$B/orders/$ORDER"
-QR1=$(curl -s "$B/orders/$ORDER" | sed 's/.*"qrCode":"\([^"]*\)".*/\1/')
+curl -sf -o /dev/null "${DBG[@]}" --retry-all-errors --retry 30 --retry-delay 1 "$B/orders/$ORDER"
+QR1=$(curl -s "${DBG[@]}" "$B/orders/$ORDER" | sed 's/.*"qrCode":"\([^"]*\)".*/\1/')
 echo "    QR: $QR1"
 
 echo
