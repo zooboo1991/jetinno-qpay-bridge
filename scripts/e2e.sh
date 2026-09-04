@@ -15,6 +15,12 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 
+# The server no longer falls back to the documentation's sample key, so the
+# test supplies it explicitly. These are the public spec's example values —
+# a test identity, never a real deployment's.
+export JETINNO_USERNAME=testname
+export JETINNO_APIKEY=DBRW17YE7FHKR72T
+
 PORT=$PORT QPAY_MOCK=1 PUBLIC_URL=$B node src/server.js > "$LOG/server.log" 2>&1 &
 curl -sf --retry-connrefused --retry 20 --retry-delay 1 "$B/health" > /dev/null
 

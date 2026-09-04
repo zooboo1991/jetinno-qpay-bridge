@@ -26,6 +26,23 @@ async function detail(res) {
     .catch(() => '');
 }
 
+/**
+ * Every QPay call is bounded. Node's default socket timeout is measured in
+ * minutes, and Jetinno gives the whole request 8 seconds — without a deadline
+ * a hung QPay connection blows that budget, and worse, a hung checkPayment
+ * holds settle()'s claim for minutes while the customer stands there having
+ * already paid.
+ */
+const TIMEOUT_MS = {
+  // On the getQrCode hot path: token (cold) + invoice must fit inside 8s with
+  // room to spare.
+  token: 2500,
+  invoice: 4000,
+  // Off the hot path, but each one holds the settle claim while it runs.
+  check: 6000,
+  cancel: 6000,
+};
+
 let tokenCache = null;
 
 /**
@@ -40,6 +57,7 @@ async function accessToken() {
   const res = await fetch(`${base()}/v2/auth/token`, {
     method: 'POST',
     headers: { Authorization: `Basic ${basic}` },
+    signal: AbortSignal.timeout(TIMEOUT_MS.token),
   });
   if (!res.ok) throw new Error(`qpay auth ${res.status}: ${await detail(res)}`);
   const json = await res.json();
@@ -55,11 +73,12 @@ async function accessToken() {
   return tokenCache.accessToken;
 }
 
-async function authed(path, init) {
+async function authed(path, init, timeoutMs) {
   const token = await accessToken();
   return fetch(`${base()}${path}`, {
     ...init,
     headers: { ...init.headers, Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(timeoutMs),
   });
 }
 
@@ -79,7 +98,7 @@ export async function createInvoice({ orderNo, amount, description, callbackUrl 
       amount,
       callback_url: callbackUrl,
     }),
-  });
+  }, TIMEOUT_MS.invoice);
   if (!res.ok) throw new Error(`qpay invoice ${res.status}: ${await detail(res)}`);
 
   const json = await res.json();
@@ -108,7 +127,7 @@ export async function checkPayment(invoiceId) {
       object_id: invoiceId,
       offset: { page_number: 1, page_limit: 100 },
     }),
-  });
+  }, TIMEOUT_MS.check);
   if (!res.ok) throw new Error(`qpay check ${res.status}: ${await detail(res)}`);
 
   const json = await res.json();
@@ -132,7 +151,7 @@ export async function checkPayment(invoiceId) {
  * means the customer did pay, and the caller has to settle instead of voiding.
  */
 export async function cancelInvoice(invoiceId) {
-  const res = await authed(`/v2/invoice/${invoiceId}`, { method: 'DELETE' });
+  const res = await authed(`/v2/invoice/${invoiceId}`, { method: 'DELETE' }, TIMEOUT_MS.cancel);
   if (res.ok || res.status === 404) return { cancelled: true };
 
   const text = await detail(res);

@@ -5,8 +5,21 @@ import * as qpay from './qpay.js';
 const app = express();
 app.use(express.json());
 
-const APIKEY = process.env.JETINNO_APIKEY ?? 'DBRW17YE7FHKR72T';
-const USERNAME = process.env.JETINNO_USERNAME ?? 'testname';
+/**
+ * No fallback values. The documentation's sample key used to sit here as a
+ * default, in a public repository — so any deploy that lost JETINNO_APIKEY
+ * would keep serving happily while accepting requests signed with a key the
+ * whole internet can read. Refusing to boot turns that silent downgrade into
+ * an obvious failure.
+ */
+function requiredEnv(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} орчны хувьсагч тохируулаагүй байна`);
+  return value;
+}
+
+const APIKEY = requiredEnv('JETINNO_APIKEY');
+const USERNAME = requiredEnv('JETINNO_USERNAME');
 // QPay builds its callback from this, so it has to be the origin the outside
 // world reaches — never localhost in production. Render injects
 // RENDER_EXTERNAL_URL with the service's own https origin, which saves
@@ -230,7 +243,11 @@ app.all('/qpay/callback/:orderNo', (req, res) => {
 // QPay payment gets confirmed during local testing without a tunnel.
 app.get('/check/:orderNo', settleRoute);
 
-app.all('/mock/pay/:orderNo', settleRoute);
+// Only exists in mock mode. Registered unconditionally it was harmless today
+// (settle still verifies against QPay), but it is one stray QPAY_MOCK=1 away
+// from being a public free-coffee endpoint — so it should not exist at all in
+// a real deployment.
+if (MOCK) app.all('/mock/pay/:orderNo', settleRoute);
 
 // Debug endpoints are gated behind DEBUG_KEY: the log ring includes expected
 // signatures on SIGN_ERROR, and handing those out publicly would let anyone
