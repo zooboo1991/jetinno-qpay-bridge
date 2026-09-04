@@ -160,6 +160,21 @@ export const markCancelled = (orderId) => one(`select * from app.mark_cancelled(
 export const recordProductDone = (orderId, ok) =>
   one(`select * from app.record_product_done($1, $2)`, [orderId, ok]);
 
+/**
+ * The owner dashboard's numbers, aggregated in Postgres.
+ *
+ * `ownerId` must come from a verified JWT, never from a request body: this is
+ * the whole of the access control on the query, because app.owner_stats has no
+ * other scope. Everything the function reads is joined to this argument.
+ */
+export async function ownerStats(ownerId, { timezone, now } = {}) {
+  const { rows } = await query(
+    `select app.owner_stats($1, coalesce($2, 'Asia/Ulaanbaatar'), coalesce($3::timestamptz, now())) as stats`,
+    [ownerId, timezone ?? null, now ?? null]
+  );
+  return rows[0]?.stats ?? null;
+}
+
 export async function claimAbandoned({ limit, leaseSeconds, instance } = {}) {
   const { rows } = await query(`select * from app.claim_abandoned_orders($1, $2, $3)`, [
     limit ?? 50,
