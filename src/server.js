@@ -3,7 +3,20 @@ import { SIGNABLE, buildSign, verifySign, flatten, timestamp } from './sign.js';
 import * as qpay from './qpay.js';
 
 const app = express();
-app.use(express.json());
+/**
+ * Deliberately NOT a global parser.
+ *
+ * body-parser sets `req._body` before parsing and skips if it is already set,
+ * so a global parser makes any later route-scoped limit dead code — a 50 KB
+ * body reached the handlers with HTTP 200. It also attaches the raw request
+ * text to `err.body` when JSON is malformed, so once credential routes exist,
+ * a single well-meaning error-logging middleware would put a merchant's
+ * password into the /recent ring.
+ *
+ * Each route opts in with the smallest limit it can use. A Jetinno request is
+ * a few hundred bytes.
+ */
+const jetinnoBody = express.json({ limit: '16kb' });
 
 /**
  * No fallback values. The documentation's sample key used to sit here as a
@@ -70,7 +83,7 @@ function failSign(res, check) {
   res.json({ returnCode: 'FAIL', msg: 'SIGN_ERROR' });
 }
 
-app.post('/jetinno/getQrCode', async (req, res) => {
+app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
   log('getQrCode <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.getQrCodeRequest, APIKEY);
   if (!check.ok) return failSign(res, check);
@@ -133,7 +146,7 @@ app.post('/jetinno/getQrCode', async (req, res) => {
   }
 });
 
-app.post('/jetinno/productdone', (req, res) => {
+app.post('/jetinno/productdone', jetinnoBody, (req, res) => {
   log('productdone <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.productDoneRequest, APIKEY);
   if (!check.ok) return failSign(res, check);
@@ -145,7 +158,7 @@ app.post('/jetinno/productdone', (req, res) => {
   res.json({ returnCode: 'SUCCESS', msg: 'SUCCESS' });
 });
 
-app.post('/jetinno/refund', (req, res) => {
+app.post('/jetinno/refund', jetinnoBody, (req, res) => {
   log('refund <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.refundRequest, APIKEY);
   if (!check.ok) return failSign(res, check);
