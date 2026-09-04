@@ -142,7 +142,11 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
     log('getQrCode ->', orderNo, `${amount}₮`, qrCode);
     respond(res, { deviceNo, orderNo, qrCode }, SIGNABLE.getQrCodeResponse);
   } catch (err) {
-    fail(res, `SYSTEM_ERROR: ${err.message}`);
+    // The detail goes to the log, not to the caller. err.message here can
+    // carry up to 300 characters of a QPay response body, and this response
+    // travels back through Jetinno's servers to the machine.
+    log('getQrCode failed', orderNo, err.message);
+    fail(res, 'SYSTEM_ERROR');
   }
 });
 
@@ -266,23 +270,59 @@ if (MOCK) app.all('/mock/pay/:orderNo', settleRoute);
 // signatures on SIGN_ERROR, and handing those out publicly would let anyone
 // forge a valid request in one round trip. No key configured — no endpoint.
 const DEBUG_KEY = process.env.DEBUG_KEY ?? '';
-const debugAllowed = (req) => DEBUG_KEY && req.query.key === DEBUG_KEY;
 
-// Server log, phone-readable on site: /recent?key=<DEBUG_KEY>
+/**
+ * The debug key is accepted in a header, or once in the query string.
+ *
+ * A header alone would be correct and would also destroy the reason these
+ * endpoints exist: an installer standing at a machine opens them in a phone
+ * browser, where headers cannot be set. So a `?key=` is exchanged for an
+ * httpOnly cookie and the caller is redirected to the clean URL — the key
+ * appears in one access-log line instead of every request, and never in the
+ * address bar after the first hop.
+ */
+const COOKIE_RE = /(?:^|;\s*)dbg=([^;]+)/;
+
+function debugAllowed(req) {
+  if (!DEBUG_KEY) return false;
+  if (req.get('x-debug-key') === DEBUG_KEY) return true;
+  const cookie = COOKIE_RE.exec(req.headers.cookie ?? '');
+  return cookie ? decodeURIComponent(cookie[1]) === DEBUG_KEY : false;
+}
+
+/** Returns true when it has handled the request itself. */
+function exchangeKeyForCookie(req, res) {
+  if (!DEBUG_KEY || req.query.key !== DEBUG_KEY) return false;
+  res.setHeader(
+    'Set-Cookie',
+    `dbg=${encodeURIComponent(DEBUG_KEY)}; HttpOnly; Path=/; Max-Age=3600; SameSite=Strict`
+  );
+  res.redirect(302, req.path);
+  return true;
+}
+
+// Server log, phone-readable on site. First visit: /recent?key=<DEBUG_KEY>
 app.get('/recent', (req, res) => {
+  if (exchangeKeyForCookie(req, res)) return;
   if (!debugAllowed(req)) return res.status(404).end();
   res.type('text/plain').send(recent.join('\n') || '(лог хоосон)');
 });
 
-// Every order this process has seen: /orders?key=<DEBUG_KEY>
 app.get('/orders', (req, res) => {
+  if (exchangeKeyForCookie(req, res)) return;
   if (!debugAllowed(req)) return res.status(404).end();
   res.json([...orders.entries()].map(([orderNo, o]) => ({ orderNo, ...o })));
 });
 
-// Read-only view of an order. Handy on site: after a machine goes quiet, this
-// says whether the bridge ever saw the order and what state it reached.
+/**
+ * Read-only view of an order — gated like the others. It was open, which meant
+ * anyone who guessed an orderNo could read that machine's notifyUrl and QPay
+ * invoice id. Neither is a credential, but neither is anyone else's business,
+ * and orderNo is a timestamp with a short prefix.
+ */
 app.get('/orders/:orderNo', (req, res) => {
+  if (exchangeKeyForCookie(req, res)) return;
+  if (!debugAllowed(req)) return res.status(404).end();
   const order = orders.get(req.params.orderNo);
   if (!order) return res.status(404).json({ error: 'unknown order' });
   res.json({ orderNo: req.params.orderNo, ...order });
