@@ -8,12 +8,14 @@
     "dev": "node --watch src/server.js",
     "simulate": "node src/simulate-machine.js",
     "test:e2e": "bash scripts/e2e.sh",
-    "test:crypto": "node scripts/crypto-test.mjs"
+    "test:crypto": "node scripts/crypto-test.mjs",
+    "test:store": "bash scripts/store-test.sh"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "pg": "^8.23.0"
   }
 }
