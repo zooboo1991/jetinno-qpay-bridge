@@ -31,18 +31,32 @@ const GATEWAY_PORT = 4601;
 let sent = [];
 let gatewayMode = 'ok';
 const gateway = createServer((req, res) => {
-  const url = new URL(req.url, `http://localhost:${GATEWAY_PORT}`);
-  sent.push({
-    to: url.searchParams.get('sendto'),
-    message: url.searchParams.get('message'),
-    token: url.searchParams.get('token'),
+  let body = '';
+  req.on('data', (d) => (body += d));
+  req.on('end', () => {
+    const url = new URL(req.url, `http://localhost:${GATEWAY_PORT}`);
+    // Params may arrive in the query string or the form body depending on the
+    // configured method; the fake gateway reads both, like the real one does.
+    const params = new URLSearchParams(body || url.search);
+    sent.push({
+      method: req.method,
+      url: req.url,
+      to: params.get('sendto'),
+      message: params.get('message'),
+      token: params.get('token'),
+    });
+    if (gatewayMode === 'fail') {
+      res.statusCode = 500;
+      return res.end('gateway exploded');
+    }
+    if (gatewayMode === 'softfail') return res.end('ERROR: balance');
+    // The real Skytel endpoint answers 200 with a JSON status; a failed send
+    // is status 0, which must never be recorded as delivered.
+    if (gatewayMode === 'jsonfail') {
+      return res.end('{"status":0,"sent_count":0,"message":"Дугаар буруу"}');
+    }
+    res.end('{"status":1,"sent_count":1}');
   });
-  if (gatewayMode === 'fail') {
-    res.statusCode = 500;
-    return res.end('gateway exploded');
-  }
-  if (gatewayMode === 'softfail') return res.end('ERROR: balance');
-  res.end('OK');
 });
 await new Promise((r) => gateway.listen(GATEWAY_PORT, '127.0.0.1', r));
 
@@ -82,7 +96,7 @@ const bridge = spawn(process.execPath, ['src/server.js'], {
     PUBLIC_URL: `http://localhost:${PORT}`,
     SEND_SMS_HOOK_SECRET: SECRET,
     SMS_API_URL: `http://127.0.0.1:${GATEWAY_PORT}/apiSend`,
-    SMS_API_METHOD: 'GET',
+    // SMS_API_METHOD deliberately unset: the default must be POST.
     SMS_PARAM_TO: 'sendto',
     SMS_PARAM_TEXT: 'message',
     SMS_PARAM_KEY: 'token',
@@ -234,15 +248,60 @@ await check('гарцын түлхүүр параметрээр явсан', asy
   return sent[0]?.token === 'test-gateway-token';
 });
 
+// Skytel-д HTTPS байхгүй (порт 443 хариу өгдөггүй), тиймээс хүсэлт задгай
+// сүлжээгээр явна. POST нь ядаж кодыг URL-аас гаргаж, замын дагуух бүх
+// хандалтын логоос салгана.
+await check('POST-оор явна — код ба токен URL-д ороогүй', async () => {
+  sent = [];
+  const body = payloadFor(MEMBER_PHONE, '777888');
+  await post(body, sign(body));
+  const g = sent[0];
+  return (
+    g?.method === 'POST' &&
+    !g.url.includes('777888') &&
+    !g.url.includes('test-gateway-token') &&
+    g.message.includes('777888')
+  );
+});
+
+await check('гарц 200 дотор status:0 буцаавал амжилтгүй — тохиргоо шаардахгүй', async () => {
+  gatewayMode = 'jsonfail';
+  const body = payloadFor(MEMBER_PHONE);
+  const r = await post(body, sign(body));
+  gatewayMode = 'ok';
+  const { rows } = await query(
+    `select ok from public.sms_sends where phone = $1 order by at desc limit 1`,
+    [MEMBER_PHONE]
+  );
+  return r.status === 502 && rows[0]?.ok === false;
+});
+
+await check('гарцын хариу хадгалагдана — амжилтын хэлбэрийг мэдэхийн тулд', async () => {
+  const body = payloadFor(MEMBER_PHONE);
+  await post(body, sign(body));
+  const { rows } = await query(
+    `select gateway_reply from public.sms_sends where phone = $1 and ok order by at desc limit 1`,
+    [MEMBER_PHONE]
+  );
+  return (rows[0]?.gateway_reply ?? '').includes('sent_count');
+});
+
 // ---- what gets recorded --------------------------------------------------
 await check('лог мессежийн текст ч, OTP ч хадгалдаггүй', async () => {
   const { rows } = await query(`select * from public.sms_sends order by at desc limit 20`);
   const blob = JSON.stringify(rows);
-  return rows.length > 0 && !blob.includes('654321') && !blob.includes('123456') && !blob.includes('Coffeine');
+  return (
+    rows.length > 0 &&
+    !blob.includes('654321') &&
+    !blob.includes('123456') &&
+    !blob.includes('777888') &&
+    !blob.includes('111222') &&
+    !blob.includes('Coffeine')
+  );
 });
 
 await check('серверийн лог OTP-г хэвлэдэггүй', () => {
-  return !bridgeLog.includes('123456') && !bridgeLog.includes('654321');
+  return ['123456', '654321', '777888', '111222'].every((c) => !bridgeLog.includes(c));
 });
 
 await check('серверийн лог бүтэн дугаар хэвлэдэггүй', () => {

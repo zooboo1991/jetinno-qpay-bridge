@@ -139,11 +139,19 @@ export function authHook({ log = () => {} } = {}) {
         }
 
         const result = await sendSms(phone, otpMessage(code));
-        await query(`select app.record_sms_send($1, 'otp', $2, $3, $4)`, [
+
+        // Whatever the gateway echoed back, the code does not go into the
+        // database with it. This gateway returns a small status object and
+        // does not repeat the message — but "does not today" is not a
+        // property worth betting a table of live login codes on.
+        const scrub = (text) => (text == null ? null : String(text).split(code).join('******'));
+
+        await query(`select app.record_sms_send($1, 'otp', $2, $3, $4, $5)`, [
           phone,
           result.ok,
           result.status ?? null,
-          result.ok ? null : (result.error ?? null),
+          result.ok ? null : scrub(result.error),
+          scrub(result.reply ?? result.error),
         ]);
 
         if (!result.ok) {

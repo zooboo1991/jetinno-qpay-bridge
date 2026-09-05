@@ -27,6 +27,11 @@ create table public.sms_sends (
   purpose        text not null check (purpose in ('otp')),
   ok             boolean not null,
   gateway_status integer,
+  -- What the gateway said back, with the code scrubbed out before it gets
+  -- here. Kept because the gateway answers 200 with the outcome in the body,
+  -- and without a record of that body a send that silently failed is
+  -- indistinguishable from one that worked.
+  gateway_reply  text,
   error          text,
   at             timestamptz not null default now()
 );
@@ -130,19 +135,20 @@ create or replace function app.record_sms_send(
   p_purpose        text,
   p_ok             boolean,
   p_gateway_status integer default null,
-  p_error          text default null
+  p_error          text default null,
+  p_gateway_reply  text default null
 ) returns void
 language sql volatile security definer set search_path = '' as $$
-  insert into public.sms_sends (phone, purpose, ok, gateway_status, error)
+  insert into public.sms_sends (phone, purpose, ok, gateway_status, error, gateway_reply)
   values (app.norm_phone(p_phone), p_purpose, p_ok, p_gateway_status,
           -- Gateway bodies can be long and can echo the request. Truncated,
-          -- and never the message text.
-          left(p_error, 200));
+          -- and the caller has already removed the code from both.
+          left(p_error, 200), left(p_gateway_reply, 200));
 $$;
 
 revoke all on function app.phone_may_receive_otp(text) from public, anon, authenticated;
 revoke all on function app.sms_budget(text, integer, integer) from public, anon, authenticated;
-revoke all on function app.record_sms_send(text, text, boolean, integer, text) from public, anon, authenticated;
+revoke all on function app.record_sms_send(text, text, boolean, integer, text, text) from public, anon, authenticated;
 grant execute on function app.phone_may_receive_otp(text) to service_role;
 grant execute on function app.sms_budget(text, integer, integer) to service_role;
-grant execute on function app.record_sms_send(text, text, boolean, integer, text) to service_role;
+grant execute on function app.record_sms_send(text, text, boolean, integer, text, text) to service_role;

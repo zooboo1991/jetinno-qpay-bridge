@@ -15,7 +15,13 @@
 
 const CONFIG = {
   url: process.env.SMS_API_URL ?? '',
-  method: (process.env.SMS_API_METHOD ?? 'GET').toUpperCase(),
+  // POST by default. Skytel Web2SMS has no HTTPS listener at all — port 443
+  // does not answer — so the request crosses the network in the clear either
+  // way. POST at least keeps the login code and the API token out of the URL,
+  // and therefore out of every access log along the path that records one.
+  // Verified against the live endpoint: POST with a form body is parsed
+  // identically to the query string.
+  method: (process.env.SMS_API_METHOD ?? 'POST').toUpperCase(),
   paramTo: process.env.SMS_PARAM_TO ?? 'sendto',
   paramText: process.env.SMS_PARAM_TEXT ?? 'message',
   paramKey: process.env.SMS_PARAM_KEY ?? 'token',
@@ -23,9 +29,11 @@ const CONFIG = {
   from: process.env.SMS_FROM ?? '',
   apiKey: process.env.SMS_API_KEY ?? '',
   extra: process.env.SMS_EXTRA_PARAMS ?? '',
-  // Some gateways answer 200 with an error in the body. This is the word that
-  // means it went wrong.
+  // Gateways answer 200 with the failure in the body. Either a literal
+  // substring or a pattern; the pattern exists because the useful signal is
+  // usually a JSON field whose spacing is not guaranteed.
   errorMatch: process.env.SMS_ERROR_MATCH ?? '',
+  errorRegex: process.env.SMS_ERROR_REGEX ?? '',
   transliterate: process.env.SMS_TRANSLITERATE !== 'false',
 };
 
@@ -81,6 +89,18 @@ export function localNumber(phone) {
  * arrive" into "the login button did nothing", which is a worse thing to
  * explain over the phone.
  */
+function reportsFailure(replyText) {
+  if (!replyText.trimStart().startsWith('{')) return false;
+  try {
+    const json = JSON.parse(replyText);
+    if (json.status === 0 || json.status === false || json.status === '0') return true;
+    if (typeof json.sent_count === 'number' && json.sent_count === 0) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export async function sendSms(phone, text, { timeoutMs = 6000 } = {}) {
   if (!smsConfigured()) return { ok: false, status: null, error: 'SMS_NOT_CONFIGURED' };
 
@@ -111,6 +131,17 @@ export async function sendSms(phone, text, { timeoutMs = 6000 } = {}) {
 
     if (!res.ok) return { ok: false, status: res.status, error: replyText };
     if (CONFIG.errorMatch && replyText.includes(CONFIG.errorMatch)) {
+      return { ok: false, status: res.status, error: replyText };
+    }
+    if (CONFIG.errorRegex && new RegExp(CONFIG.errorRegex).test(replyText)) {
+      return { ok: false, status: res.status, error: replyText };
+    }
+    // Fail closed on a JSON body that reports its own failure, whatever the
+    // configuration says. The two mistakes are not equal: a false failure
+    // shows an error the owner can retry past, while a false success spends
+    // the send, consumes their hourly budget, and leaves them waiting for a
+    // code we believe we delivered.
+    if (reportsFailure(replyText)) {
       return { ok: false, status: res.status, error: replyText };
     }
     return { ok: true, status: res.status, reply: replyText };
