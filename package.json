@@ -11,7 +11,8 @@
     "test:crypto": "node scripts/crypto-test.mjs",
     "test:store": "bash scripts/store-test.sh",
     "test:stats": "bash scripts/stats-test.sh",
-    "test:owner-api": "bash scripts/owner-api-test.sh"
+    "test:owner-api": "bash scripts/owner-api-test.sh",
+    "test:sms": "bash scripts/sms-hook-test.sh"
   },
   "engines": {
     "node": ">=20"

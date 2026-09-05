@@ -4,6 +4,7 @@ import * as qpay from './qpay.js';
 import * as db from './db.js';
 import * as store from './store.js';
 import { ownerApi, authConfigured } from './owner-api.js';
+import { authHook, authHookConfigured } from './auth-hook.js';
 
 const app = express();
 /**
@@ -393,6 +394,19 @@ if (authConfigured() && DUAL_WRITE) {
   log('owner api mounted', process.env.PORTAL_ORIGIN ? `origin=${process.env.PORTAL_ORIGIN}` : 'origin=(unset)');
 } else {
   log('owner api NOT mounted', `supabase=${authConfigured()} db=${DUAL_WRITE}`);
+}
+
+/*
+ * Supabase's Send SMS hook. Needs a signing secret, a configured gateway and a
+ * database to check the invite list against — anything missing and it does not
+ * exist, because the failure mode of a half-configured SMS endpoint is a phone
+ * bill.
+ */
+if (authHookConfigured() && DUAL_WRITE) {
+  app.use('/hooks', authHook({ log }));
+  log('send-sms hook mounted');
+} else {
+  log('send-sms hook NOT mounted', `secret+gateway=${authHookConfigured()} db=${DUAL_WRITE}`);
 }
 
 // Debug endpoints are gated behind DEBUG_KEY: the log ring includes expected
