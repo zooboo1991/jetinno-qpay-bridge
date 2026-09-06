@@ -5,6 +5,7 @@ import * as db from './db.js';
 import * as store from './store.js';
 import { ownerApi, authConfigured } from './owner-api.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
+import { open, credentialAad } from './crypto.js';
 
 const app = express();
 /**
@@ -123,6 +124,93 @@ function failSign(res, check) {
   res.json({ returnCode: 'FAIL', msg: 'SIGN_ERROR' });
 }
 
+/**
+ * Which merchant a sale on this device belongs to.
+ *
+ * The business model is that each machine's revenue lands in ITS OWNER's QPay
+ * account, so this is the routing decision for actual money:
+ *
+ *   owner client   — the machine is registered and its credential is usable.
+ *   env fallback   — no database, database unreachable, or a device nobody
+ *                    has registered. The operator's own merchant takes the
+ *                    sale; for an unregistered device that is today's exact
+ *                    behavior, and for a database blip it keeps coffee
+ *                    working — the Map-decides rule extends to routing.
+ *   refusal        — the machine IS registered but its credential, owner or
+ *                    machine row is disabled. Falling back to env here would
+ *                    take a known owner's money into the operator's account,
+ *                    which is worse than a failed sale: one is an apology,
+ *                    the other is an accounting dispute.
+ *
+ * Every non-happy outcome leaves a durable ingest_errors row when the
+ * database can be reached, because after the cutover these are the cases
+ * that stop a sale — and a log line that rotates away is not a record.
+ */
+async function merchantFor(deviceNo, orderNo) {
+  if (!DUAL_WRITE) return { client: null, source: 'env' };
+
+  let machine;
+  try {
+    machine = await store.resolveMachine(deviceNo);
+  } catch (err) {
+    log('merchant resolve failed, env fallback', deviceNo, err.message.split('\n')[0]);
+    return { client: null, source: 'env-db-down' };
+  }
+
+  if (!machine) {
+    dw('ingestError', () =>
+      store.logIngestError({ path: '/jetinno/getQrCode', deviceNo, orderNo, reason: 'DEVICE_NOT_REGISTERED' })
+    );
+    return { client: null, source: 'env-unregistered' };
+  }
+
+  const blocked =
+    machine.machine_status !== 'active'
+      ? `MACHINE_${machine.machine_status}`
+      : machine.owner_status !== 'active'
+        ? `OWNER_${machine.owner_status}`
+        : machine.credential_status !== 'active'
+          ? `CREDENTIAL_${machine.credential_status}`
+          : !machine.credential_active
+            ? 'CREDENTIAL_INACTIVE'
+            : null;
+  if (blocked) {
+    const reason = `SALE_REFUSED_${blocked}`.toUpperCase();
+    log('sale refused', deviceNo, reason);
+    dw('ingestError', () => store.logIngestError({ path: '/jetinno/getQrCode', deviceNo, orderNo, reason }));
+    return { refused: reason, machine };
+  }
+
+  // MOCK mode has no QPay to talk to, so no client — but the registration and
+  // status gates above still ran, which is what the tests exercise.
+  if (MOCK) return { client: null, source: 'mock', machine };
+
+  try {
+    const cred = open(machine.sealed, {
+      context: credentialAad({ credentialId: machine.qpay_credential_id, ownerId: machine.owner_id }),
+    });
+    return {
+      client: qpay.clientFor({
+        username: cred.username,
+        password: cred.password,
+        invoiceCode: cred.invoice_code,
+        cacheKey: machine.qpay_credential_id,
+      }),
+      source: 'owner',
+      machine,
+    };
+  } catch (err) {
+    // A registered owner whose credential cannot be unsealed: the sealing key
+    // is wrong or the row was tampered with. Refuse — env fallback here would
+    // misroute the owner's money.
+    log('credential unseal failed', deviceNo, err.message.split('\n')[0]);
+    dw('ingestError', () =>
+      store.logIngestError({ path: '/jetinno/getQrCode', deviceNo, orderNo, reason: 'CREDENTIAL_UNSEAL_FAILED' })
+    );
+    return { refused: 'CREDENTIAL_UNSEAL_FAILED', machine };
+  }
+}
+
 app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
   log('getQrCode <-', JSON.stringify(req.body));
   const check = verifySign(req.body, SIGNABLE.getQrCodeRequest, APIKEY);
@@ -165,6 +253,11 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
   const amount = Math.round(Number(orderAmount) / AMOUNT_DIVISOR);
   if (!Number.isFinite(amount) || amount <= 0) return fail(res, `PARAM_ERROR: orderAmount=${orderAmount}`);
 
+  // Whose QPay account takes this sale. Resolved BEFORE the invoice exists,
+  // because it decides which merchant the invoice is created under.
+  const merchant = await merchantFor(deviceNo, orderNo);
+  if (merchant.refused) return fail(res, 'SYSTEM_ERROR');
+
   // Registered in the Map BEFORE the QPay round trip, so a machine retry that
   // arrives mid-flight finds this entry and awaits `pending` above instead of
   // creating a duplicate invoice on the request the machine is actually
@@ -179,12 +272,15 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
     settling: false,
     createdAt: Date.now(),
   };
+  // A function-valued property: JSON.stringify skips it, so the debug /orders
+  // dump can never serialize the credential closed over inside the client.
+  if (merchant.client) order.qpay = merchant.client;
 
   const callbackUrl = `${PUBLIC_URL}/qpay/callback/${orderNo}`;
   order.pending = (async () => {
     const invoice = MOCK
       ? { invoiceId: `mock-${orderNo}`, shortUrl: `${PUBLIC_URL}/mock/pay/${orderNo}`, qrText: null }
-      : await qpay.createInvoice({
+      : await (order.qpay ?? qpay).createInvoice({
           orderNo,
           amount,
           description: productName || `Coffee ${productId}`,
@@ -234,19 +330,9 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
     respond(res, { deviceNo, orderNo, qrCode }, SIGNABLE.getQrCodeResponse);
 
     dw('beginOrder', async () => {
-      const machine = await store.resolveMachine(deviceNo);
-      if (!machine) {
-        // The machine is not registered yet — expected until it is seeded, and
-        // worth a row rather than a log line that rotates away, because after
-        // the cutover this is the case that stops a sale.
-        await store.logIngestError({
-          path: '/jetinno/getQrCode',
-          deviceNo,
-          orderNo,
-          reason: 'DEVICE_NOT_REGISTERED',
-        });
-        return;
-      }
+      // merchantFor already resolved (and logged the unregistered case).
+      const machine = merchant.machine ?? (await store.resolveMachine(deviceNo));
+      if (!machine) return;
       const inserted = await store.beginOrder({
         machineId: machine.machine_id,
         ownerId: machine.owner_id,
@@ -369,6 +455,35 @@ async function rehydrateOrder(orderNo) {
       createdAt: new Date(row.created_at).getTime(),
       rehydrated: true,
     };
+
+    // The invoice was issued under the credential snapshotted on the row, and
+    // only that credential can check or cancel it. Rebuilt even for a
+    // credential that has since been deactivated: settlement of an existing
+    // sale must finish under the merchant that took the money — deactivation
+    // gates NEW invoices, not the completion of old ones. If it cannot be
+    // unsealed at all, settling is impossible and the caller's 503 keeps
+    // QPay retrying while someone looks.
+    if (!MOCK && row.qpay_credential_id) {
+      const cred = await store.getCredentialById(row.qpay_credential_id);
+      if (!cred?.sealed) {
+        log('rehydrate: credential row missing', orderNo);
+        return null;
+      }
+      try {
+        const plain = open(cred.sealed, {
+          context: credentialAad({ credentialId: row.qpay_credential_id, ownerId: cred.owner_id }),
+        });
+        order.qpay = qpay.clientFor({
+          username: plain.username,
+          password: plain.password,
+          invoiceCode: plain.invoice_code,
+          cacheKey: row.qpay_credential_id,
+        });
+      } catch (err) {
+        log('rehydrate: unseal failed', orderNo, err.message.split('\n')[0]);
+        return null;
+      }
+    }
     orders.set(orderNo, order);
     log('order rehydrated from db', orderNo, `was ${row.status}`);
     return order;
@@ -392,7 +507,9 @@ async function settle(orderNo) {
   order.settling = true;
   try {
     if (!MOCK) {
-      const { paid, paymentId, amount } = await qpay.checkPayment(order.invoiceId);
+      // The credential that ISSUED the invoice answers for it — owner orders
+      // check under the owner's merchant, env orders under the operator's.
+      const { paid, paymentId, amount } = await (order.qpay ?? qpay).checkPayment(order.invoiceId);
       if (!paid) return { ok: false, reason: 'not paid yet' };
       order.paymentRef = paymentId;
       order.paidAmount = amount;
@@ -627,7 +744,7 @@ async function sweepAbandoned() {
       continue;
     }
     try {
-      const result = await qpay.cancelInvoice(order.invoiceId);
+      const result = await (order.qpay ?? qpay).cancelInvoice(order.invoiceId);
       // Anything after an await must re-check the status it wrote before the
       // await: a QPay webhook can run settle() to completion while
       // cancelInvoice is in flight. Writing 'awaiting_payment' over that

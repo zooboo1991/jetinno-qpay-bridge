@@ -150,6 +150,17 @@ export const markPaymentConfirmed = (orderId, { paymentId, paidAmountMnt, leaseS
     leaseSeconds ?? 60,
   ]);
 
+/** A credential row by id, for rebuilding an order's QPay client on rehydrate. */
+export async function getCredentialById(credentialId) {
+  const { rows } = await query(
+    `select c.id, c.owner_id, c.sealed, c.key_id, c.status, c.is_active
+       from public.qpay_credentials c
+      where c.id = $1`,
+    [credentialId]
+  );
+  return rows[0] ?? null;
+}
+
 /**
  * The restart-recovery read: a live order by its orderNo alone.
  *

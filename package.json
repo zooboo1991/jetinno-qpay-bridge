@@ -13,7 +13,8 @@
     "test:stats": "bash scripts/stats-test.sh",
     "test:owner-api": "bash scripts/owner-api-test.sh",
     "test:sms": "bash scripts/sms-hook-test.sh",
-    "test:recovery": "bash scripts/recovery-test.sh"
+    "test:recovery": "bash scripts/recovery-test.sh",
+    "test:tenant": "bash scripts/tenant-test.sh"
   },
   "engines": {
     "node": ">=20"
