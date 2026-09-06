@@ -39,6 +39,27 @@ export const configured = () => Boolean(process.env.DATABASE_URL);
 
 export const query = (text, params) => pool.query(text, params);
 
+/**
+ * One transaction on one client. Used only OFF the request path (owner
+ * registration), never where the machine's 8-second budget lives: a
+ * transaction pins a pooled connection for its whole span, and the comment at
+ * the top of store.js explains why the hot path never does that.
+ */
+export async function tx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await fn((text, params) => client.query(text, params));
+    await client.query('commit');
+    return result;
+  } catch (err) {
+    await client.query('rollback').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export const healthy = () =>
   pool
     .query('select 1')

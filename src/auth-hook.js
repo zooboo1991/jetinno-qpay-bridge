@@ -155,7 +155,9 @@ export function authHook({ log = () => {} } = {}) {
         ]);
 
         if (!result.ok) {
-          log('send-sms gateway failed', result.status ?? '-', String(result.error).slice(0, 80));
+          // Scrubbed like the DB write: a gateway that echoes the request
+          // body would otherwise put the live code into the log ring.
+          log('send-sms gateway failed', result.status ?? '-', scrub(String(result.error)).slice(0, 80));
           return res.status(502).json({ error: { message: 'SMS илгээж чадсангүй.' } });
         }
 

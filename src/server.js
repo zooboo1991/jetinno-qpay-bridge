@@ -6,6 +6,7 @@ import * as store from './store.js';
 import { ownerApi, authConfigured } from './owner-api.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
 import { open, credentialAad } from './crypto.js';
+import { timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 
 const app = express();
 /**
@@ -86,6 +87,12 @@ const DUAL_WRITE = db.configured();
 /** Identifies which process holds a settle lease. Render gives no stable id. */
 const INSTANCE = `${process.env.RENDER_INSTANCE_ID ?? 'local'}-${process.pid}`;
 
+// Dual-write failures counted durably-enough for /health: the counter tells
+// an uptime monitor THAT the mirror is failing; /errors and the ring tell a
+// human what exactly failed.
+let dwFailed = 0;
+let dwLastFailure = null;
+
 function dw(label, fn) {
   if (!DUAL_WRITE) return;
   const started = Date.now();
@@ -94,7 +101,11 @@ function dw(label, fn) {
     .then(() => log('dw', label, `${Date.now() - started}ms`))
     // Only the message: a pg error can carry the failing row, and that row is
     // one schema change away from holding something that should not be logged.
-    .catch((err) => log('dw FAILED', label, `${Date.now() - started}ms`, err.message.split('\n')[0]));
+    .catch((err) => {
+      dwFailed += 1;
+      dwLastFailure = { label, at: new Date().toISOString() };
+      log('dw FAILED', label, `${Date.now() - started}ms`, err.message.split('\n')[0]);
+    });
 }
 
 /** Resolves an order's Postgres id without depending on when the insert landed. */
@@ -122,6 +133,41 @@ function fail(res, msg) {
 function failSign(res, check) {
   log('SIGN_ERROR', 'expected', check.expected, 'got', check.got);
   res.json({ returnCode: 'FAIL', msg: 'SIGN_ERROR' });
+}
+
+/**
+ * The notify URL comes from the signed machine request, so using it requires
+ * a valid Jetinno signature — but the bridge still refuses to be pointed at
+ * itself or at anything inside the network it runs on. A compromised vendor
+ * key must not become an SSRF proxy that POSTs signed bodies at internal
+ * services and logs their replies for read-back.
+ *
+ * MOCK runs keep localhost: that is where the simulated machine lives.
+ */
+function notifyUrlAllowed(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  // MOCK is where the simulated machine lives; ALLOW_PRIVATE_NOTIFY is the
+  // integration tests driving a real (fake-QPay) flow against a local
+  // machine. Neither belongs in a production environment, and both are
+  // explicit enough to be found when they end up there anyway.
+  if (MOCK || process.env.ALLOW_PRIVATE_NOTIFY === '1') return true;
+  const host = url.hostname;
+  const isPrivate =
+    host === 'localhost' ||
+    host === '0.0.0.0' ||
+    host === '::1' ||
+    host.startsWith('127.') ||
+    host.startsWith('10.') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  return !isPrivate;
 }
 
 /**
@@ -252,6 +298,7 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
 
   const amount = Math.round(Number(orderAmount) / AMOUNT_DIVISOR);
   if (!Number.isFinite(amount) || amount <= 0) return fail(res, `PARAM_ERROR: orderAmount=${orderAmount}`);
+  if (!notifyUrlAllowed(notifyUrl)) return fail(res, 'PARAM_ERROR: notifyUrl');
 
   // Whose QPay account takes this sale. Resolved BEFORE the invoice exists,
   // because it decides which merchant the invoice is created under.
@@ -566,8 +613,10 @@ function settleRoute(req, res) {
   settle(req.params.orderNo)
     .then((result) => res.status(result.ok ? 200 : result.reason === 'unknown order' ? 404 : 202).json(result))
     .catch((err) => {
+      // The detail stays in the log. err.message here can carry a QPay
+      // response body, and this endpoint answers whoever asked.
       log('settle failed', req.params.orderNo, err.message);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: 'SYSTEM_ERROR' });
     });
 }
 
@@ -604,9 +653,19 @@ app.all('/qpay/callback/:orderNo', (req, res) => {
     });
 });
 
-// The same settle by hand. QPay cannot reach localhost, so this is how a real
-// QPay payment gets confirmed during local testing without a tunnel.
-app.get('/check/:orderNo', settleRoute);
+// The same settle by hand — the operator's manual recovery path, and how a
+// real QPay payment gets confirmed during local testing without a tunnel.
+// When a DEBUG_KEY is configured (every real deployment) it is required here
+// too: an open version confirmed live orderNos to anyone and let strangers
+// spend our QPay API quota. The ?key= cookie exchange keeps it usable from a
+// phone on site.
+app.get('/check/:orderNo', (req, res) => {
+  if (process.env.DEBUG_KEY) {
+    if (exchangeKeyForCookie(req, res)) return;
+    if (!debugAllowed(req)) return res.status(404).end();
+  }
+  settleRoute(req, res);
+});
 
 // Only exists in mock mode. Registered unconditionally it was harmless today
 // (settle still verifies against QPay), but it is one stray QPAY_MOCK=1 away
@@ -660,19 +719,32 @@ const DEBUG_KEY = process.env.DEBUG_KEY ?? '';
  */
 const COOKIE_RE = /(?:^|;\s*)dbg=([^;]+)/;
 
+// Constant-time compare. `===` on secrets leaks match-length through timing;
+// nobody has demonstrated extracting a key this way over the public internet,
+// but the correct comparison costs one import and zero readability.
+function keyMatches(candidate) {
+  if (typeof candidate !== 'string' || !DEBUG_KEY) return false;
+  const a = Buffer.from(candidate);
+  const b = Buffer.from(DEBUG_KEY);
+  return a.length === b.length && cryptoTimingSafeEqual(a, b);
+}
+
 function debugAllowed(req) {
   if (!DEBUG_KEY) return false;
-  if (req.get('x-debug-key') === DEBUG_KEY) return true;
+  if (keyMatches(req.get('x-debug-key'))) return true;
   const cookie = COOKIE_RE.exec(req.headers.cookie ?? '');
-  return cookie ? decodeURIComponent(cookie[1]) === DEBUG_KEY : false;
+  return cookie ? keyMatches(decodeURIComponent(cookie[1])) : false;
 }
 
 /** Returns true when it has handled the request itself. */
 function exchangeKeyForCookie(req, res) {
-  if (!DEBUG_KEY || req.query.key !== DEBUG_KEY) return false;
+  if (!DEBUG_KEY || !keyMatches(req.query.key)) return false;
+  // Secure when the proxy says the hop was TLS (Render always is); omitted on
+  // plain-HTTP local runs so the cookie still works there.
+  const secure = req.get('x-forwarded-proto') === 'https' ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
-    `dbg=${encodeURIComponent(DEBUG_KEY)}; HttpOnly; Path=/; Max-Age=3600; SameSite=Strict`
+    `dbg=${encodeURIComponent(DEBUG_KEY)}; HttpOnly; Path=/; Max-Age=3600; SameSite=Strict${secure}`
   );
   res.redirect(302, req.path);
   return true;
@@ -705,15 +777,71 @@ app.get('/orders/:orderNo', (req, res) => {
   res.json({ orderNo: req.params.orderNo, ...order });
 });
 
+/**
+ * Cheap on purpose: uptime monitors poll it, so it never touches the
+ * database. dwFailed is the one number that says the durable mirror is
+ * falling behind — a monitor alerting on it catches a broken DATABASE_URL
+ * hours before the phase-3 cutover would have.
+ */
 app.get('/health', (req, res) =>
   res.json({
     ok: true,
     mock: MOCK,
     qpayConfigured: qpay.qpayConfigured(),
+    dbConfigured: DUAL_WRITE,
+    dwFailed,
+    dwLastFailure,
     publicUrl: PUBLIC_URL,
     orders: orders.size,
   })
 );
+
+/**
+ * The durable error sinks, readable from a phone on site.
+ *
+ * Everything here already existed and was invisible: ingest_errors had no
+ * reader but psql, orders.last_error rotated out of nobody's view, sms_sends
+ * failures sat in a table. An error sink nobody can see is a log line that
+ * costs money to write.
+ */
+app.get('/errors', async (req, res) => {
+  if (exchangeKeyForCookie(req, res)) return;
+  if (!debugAllowed(req)) return res.status(404).end();
+  if (!DUAL_WRITE) return res.json({ dbConfigured: false, dwFailed, dwLastFailure });
+  try {
+    const [ingest, orderErrors, needsHuman, smsFailures] = await Promise.all([
+      db.query(
+        `select at, path, device_no, order_no, reason from public.ingest_errors
+          order by at desc limit 50`
+      ),
+      db.query(
+        `select created_at, order_no, device_no, status, amount_mnt, last_error, last_error_at, settle_attempts
+           from public.orders where last_error is not null
+          order by last_error_at desc limit 50`
+      ),
+      db.query(
+        `select created_at, order_no, device_no, amount_mnt, payment_confirmed_at, last_error
+           from public.orders where status = 'needs_human'
+          order by created_at desc limit 50`
+      ),
+      db.query(
+        `select at, phone, gateway_status, error from public.sms_sends
+          where not ok order by at desc limit 20`
+      ),
+    ]);
+    res.json({
+      dwFailed,
+      dwLastFailure,
+      needsHuman: needsHuman.rows,
+      ingestErrors: ingest.rows,
+      orderErrors: orderErrors.rows,
+      smsFailures: smsFailures.rows,
+    });
+  } catch (err) {
+    log('errors endpoint failed', err.message.split('\n')[0]);
+    res.status(500).json({ error: 'SYSTEM_ERROR' });
+  }
+});
 
 /**
  * Voids QRs nobody paid. If QPay answers INVOICE_PAID the customer did pay
