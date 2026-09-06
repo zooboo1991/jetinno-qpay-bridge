@@ -12,7 +12,8 @@
     "test:store": "bash scripts/store-test.sh",
     "test:stats": "bash scripts/stats-test.sh",
     "test:owner-api": "bash scripts/owner-api-test.sh",
-    "test:sms": "bash scripts/sms-hook-test.sh"
+    "test:sms": "bash scripts/sms-hook-test.sh",
+    "test:recovery": "bash scripts/recovery-test.sh"
   },
   "engines": {
     "node": ">=20"

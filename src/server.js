@@ -138,6 +138,26 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
   const existing = orders.get(orderNo);
   if (existing) {
     if (existing.deviceNo !== deviceNo) return fail(res, 'ORDERNO_EXIST');
+    // A retry can land while the first request is still inside the QPay round
+    // trip. Racing it would create a second invoice with the same
+    // sender_invoice_no — which QPay rejects forever — so the retry waits for
+    // the first request's outcome and answers with the same QR.
+    if (existing.pending) {
+      try {
+        await existing.pending;
+      } catch {
+        return fail(res, 'SYSTEM_ERROR');
+      }
+    }
+    if (existing.status === 'cancelled') {
+      // The sweep has voided this invoice at QPay. Handing its QR back would
+      // put an unpayable code on the screen: the customer scans, the bank
+      // refuses, and nobody in that loop can tell why. An error at least
+      // makes the machine show a failure and lets them start a fresh order.
+      log('getQrCode replay of cancelled order', orderNo);
+      return fail(res, 'SYSTEM_ERROR');
+    }
+    if (!existing.qrCode) return fail(res, 'SYSTEM_ERROR');
     log('getQrCode replay ->', orderNo, existing.qrCode);
     return respond(res, { deviceNo, orderNo, qrCode: existing.qrCode }, SIGNABLE.getQrCodeResponse);
   }
@@ -145,8 +165,23 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
   const amount = Math.round(Number(orderAmount) / AMOUNT_DIVISOR);
   if (!Number.isFinite(amount) || amount <= 0) return fail(res, `PARAM_ERROR: orderAmount=${orderAmount}`);
 
-  try {
-    const callbackUrl = `${PUBLIC_URL}/qpay/callback/${orderNo}`;
+  // Registered in the Map BEFORE the QPay round trip, so a machine retry that
+  // arrives mid-flight finds this entry and awaits `pending` above instead of
+  // creating a duplicate invoice on the request the machine is actually
+  // waiting for.
+  const order = {
+    deviceNo,
+    orderAmount,
+    notifyUrl,
+    productId,
+    amountMnt: amount,
+    status: 'creating',
+    settling: false,
+    createdAt: Date.now(),
+  };
+
+  const callbackUrl = `${PUBLIC_URL}/qpay/callback/${orderNo}`;
+  order.pending = (async () => {
     const invoice = MOCK
       ? { invoiceId: `mock-${orderNo}`, shortUrl: `${PUBLIC_URL}/mock/pay/${orderNo}`, qrText: null }
       : await qpay.createInvoice({
@@ -158,18 +193,16 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
 
     // qr_text is the standard QPay QR every bank app scans, but it is
     // routinely longer than Jetinno's 128-character qrCode field, so the
-    // short URL is what actually fits on the machine screen. Whether banks
-    // scan it is the one thing still to prove on real hardware.
+    // short URL is what actually fits on the machine screen.
     const qrCode = invoice.shortUrl ?? invoice.qrText;
-    if (!qrCode) return fail(res, 'SYSTEM_ERROR: qpay returned no qr');
-    if (qrCode.length > 128) return fail(res, `SYSTEM_ERROR: qr too long (${qrCode.length} > 128)`);
+    if (!qrCode) throw Object.assign(new Error('qpay returned no qr'), { publicMsg: 'SYSTEM_ERROR: qpay returned no qr' });
+    if (qrCode.length > 128) {
+      throw Object.assign(new Error(`qr too long (${qrCode.length})`), {
+        publicMsg: `SYSTEM_ERROR: qr too long (${qrCode.length} > 128)`,
+      });
+    }
 
-    orders.set(orderNo, {
-      deviceNo,
-      orderAmount,
-      notifyUrl,
-      productId,
-      amountMnt: amount,
+    Object.assign(order, {
       invoiceId: invoice.invoiceId,
       qrCode,
       // Kept for the Jetinno negotiation: qr_text is what bank apps scan,
@@ -177,9 +210,26 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
       // to. Visible via GET /orders/:orderNo.
       qrTextLen: invoice.qrText ? invoice.qrText.length : null,
       status: 'awaiting_payment',
-      settling: false,
-      createdAt: Date.now(),
     });
+    return invoice;
+  })();
+  orders.set(orderNo, order);
+
+  let invoice;
+  try {
+    invoice = await order.pending;
+  } catch (err) {
+    // A failed creation is removed so a later fresh retry can start over —
+    // holding the dead placeholder would turn every retry into SYSTEM_ERROR.
+    orders.delete(orderNo);
+    log('getQrCode failed', orderNo, err.message);
+    return fail(res, err.publicMsg ?? 'SYSTEM_ERROR');
+  } finally {
+    delete order.pending;
+  }
+
+  try {
+    const qrCode = order.qrCode;
     log('getQrCode ->', orderNo, `${amount}₮`, qrCode);
     respond(res, { deviceNo, orderNo, qrCode }, SIGNABLE.getQrCodeResponse);
 
@@ -217,17 +267,15 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
       if (id) {
         await store.attachInvoice(id, {
           invoiceId: invoice.invoiceId,
-          qrCode,
+          qrCode: order.qrCode,
           qrTextLen: invoice.qrText ? invoice.qrText.length : null,
         });
       }
     });
   } catch (err) {
-    // The detail goes to the log, not to the caller. err.message here can
-    // carry up to 300 characters of a QPay response body, and this response
-    // travels back through Jetinno's servers to the machine.
-    log('getQrCode failed', orderNo, err.message);
-    fail(res, 'SYSTEM_ERROR');
+    // Response/logging failure after the invoice already exists. The order
+    // stays in the Map: the machine's retry replays the stored QR.
+    log('getQrCode respond failed', orderNo, err.message);
   }
 });
 
@@ -294,9 +342,50 @@ async function notifyMachine(orderNo, order) {
  * machine has acknowledged, so a failed notify leaves the order retryable
  * rather than silently marked paid with no coffee delivered.
  */
+/**
+ * Rebuilds a Map entry from the dual-written Postgres row.
+ *
+ * Reached only when the Map has no entry — after a restart, which on Render
+ * is every deploy. The row carries the notify URL, device, amounts and the
+ * QPay invoice id: everything settle() needs to finish the sale it was
+ * mid-way through. Only live rows qualify; a paid or cancelled order stays
+ * finished.
+ */
+async function rehydrateOrder(orderNo) {
+  try {
+    const row = await store.findLiveOrder(orderNo);
+    if (!row) return null;
+    const order = {
+      deviceNo: row.device_no,
+      orderAmount: row.raw_order_amount,
+      notifyUrl: row.notify_url,
+      productId: row.product_id,
+      amountMnt: row.amount_mnt,
+      invoiceId: row.qpay_invoice_id,
+      qrCode: row.qr_code,
+      qrTextLen: row.qr_text_len,
+      status: 'awaiting_payment',
+      settling: false,
+      createdAt: new Date(row.created_at).getTime(),
+      rehydrated: true,
+    };
+    orders.set(orderNo, order);
+    log('order rehydrated from db', orderNo, `was ${row.status}`);
+    return order;
+  } catch (err) {
+    log('rehydrate failed', orderNo, err.message.split('\n')[0]);
+    return null;
+  }
+}
+
 async function settle(orderNo) {
-  const order = orders.get(orderNo);
+  let order = orders.get(orderNo);
+  // The Map is empty after every restart — and Render restarts the process on
+  // every deploy. A paid order must survive that, so a miss falls back to the
+  // dual-written Postgres row, which carries everything a settle needs.
+  if (!order && DUAL_WRITE) order = await rehydrateOrder(orderNo);
   if (!order) return { ok: false, reason: 'unknown order' };
+  if (order.pending || order.status === 'creating') return { ok: false, reason: 'not paid yet' };
   if (order.status === 'paid') return { ok: true, already: true };
   if (order.settling) return { ok: false, reason: 'settle already in progress' };
 
@@ -312,6 +401,11 @@ async function settle(orderNo) {
       order.paidAmount = order.amountMnt;
     }
 
+    // The sweep can relabel this order while checkPayment is in flight. If a
+    // concurrent path already finished the sale, this one stops here — the
+    // single-notify invariant is worth more than this call's return value.
+    if (order.status === 'paid') return { ok: true, already: true };
+
     const machineReply = await notifyMachine(orderNo, order);
     order.status = 'paid';
     order.paidAt = new Date().toISOString();
@@ -320,23 +414,29 @@ async function settle(orderNo) {
     // is still what stops a second coffee; app.claim_order_for_settle takes
     // that job at the phase-3 cutover, once a day of these timings says the
     // round trip fits inside Jetinno's budget.
-    // Each step returns the row it changed, or null for "declined". A step
-    // that declines and is ignored is not a guard: mark_payment_confirmed
-    // refusing a mismatched amount, followed by an unconditional
-    // finish_settle, is how the row reaches 'paid' with no confirmation
-    // behind it — which the orders_confirmed_shape constraint then rejects.
+    // Each step returns the row it changed, or null for "declined", and every
+    // declined or thrown step RELEASES the claim with the reason written to
+    // orders.last_error. Without the release, a declined step leaves the row
+    // in 'settling' holding a lease, with last_error empty — durable state
+    // that quietly disagrees with the Map, discovered only at the phase-3
+    // cutover. last_error is also what the /errors monitoring reads.
     dw('settle', async () => {
       const id = await pgOrderId(order.deviceNo, orderNo);
       if (!id) return;
       const claimed = await store.claimSettle(id, { leaseSeconds: 60, instance: INSTANCE });
       if (!claimed) return log('dw settle declined', orderNo, 'claim');
-      const confirmed = await store.markPaymentConfirmed(id, {
-        paymentId: order.paymentRef ?? null,
-        paidAmountMnt: order.paidAmount ?? null,
-      });
-      if (!confirmed) return log('dw settle declined', orderNo, 'confirm');
-      if (!(await store.markNotifySent(id))) return log('dw settle declined', orderNo, 'notify');
-      if (!(await store.finishSettle(id))) return log('dw settle declined', orderNo, 'finish');
+      try {
+        const confirmed = await store.markPaymentConfirmed(id, {
+          paymentId: order.paymentRef ?? null,
+          paidAmountMnt: order.paidAmount ?? null,
+        });
+        if (!confirmed) return await store.releaseSettle(id, 'confirm declined (amount/state mismatch)');
+        if (!(await store.markNotifySent(id))) return await store.releaseSettle(id, 'notify-sent declined');
+        if (!(await store.finishSettle(id))) return await store.releaseSettle(id, 'finish declined');
+      } catch (err) {
+        await store.releaseSettle(id, err.message.split('\n')[0]).catch(() => {});
+        throw err;
+      }
     });
 
     return { ok: true, machineReply };
@@ -365,9 +465,26 @@ function settleRoute(req, res) {
  */
 app.all('/qpay/callback/:orderNo', (req, res) => {
   settle(req.params.orderNo)
-    .then((result) => log('qpay callback', req.params.orderNo, JSON.stringify(result)))
-    .catch((err) => log('qpay callback failed', req.params.orderNo, err.message))
-    .finally(() => res.status(200).send('SUCCESS'));
+    .then((result) => {
+      log('qpay callback', req.params.orderNo, JSON.stringify(result));
+      // 'unknown order' is the one outcome that must NOT be answered SUCCESS.
+      // SUCCESS is what stops QPay's retries, and for an order this process
+      // has genuinely lost (restart with the row also missing), the retry IS
+      // the recovery path: by the next attempt the rehydration above may have
+      // a database to read. Every other outcome — settled, already settled,
+      // not paid yet — is final for this callback and answers SUCCESS.
+      if (!result.ok && result.reason === 'unknown order') {
+        return res.status(503).send('RETRY');
+      }
+      res.status(200).send('SUCCESS');
+    })
+    .catch((err) => {
+      log('qpay callback failed', req.params.orderNo, err.message);
+      // A transient settle failure still answers SUCCESS: the sweep finds the
+      // payment on the next pass (cancelInvoice -> INVOICE_PAID -> settle),
+      // and an error here would have QPay hammering a struggling process.
+      res.status(200).send('SUCCESS');
+    });
 });
 
 // The same settle by hand. QPay cannot reach localhost, so this is how a real
@@ -485,38 +602,81 @@ app.get('/health', (req, res) =>
  * Voids QRs nobody paid. If QPay answers INVOICE_PAID the customer did pay
  * after all and the order is settled instead of thrown away.
  */
+// Finished orders are kept a day for replay/productdone matching, then
+// evicted. Without this the Map — the process's source of truth — grows by
+// every sale ever made and the fix arrives as an OOM restart at month three.
+const RETAIN_FINISHED_MS = Number(process.env.RETAIN_FINISHED_MS ?? 24 * 60 * 60 * 1000);
+
 async function sweepAbandoned() {
   const now = Date.now();
   for (const [orderNo, order] of orders) {
-    if (order.status !== 'awaiting_payment' || order.settling) continue;
+    if (
+      (order.status === 'paid' || order.status === 'cancelled') &&
+      now - order.createdAt > RETAIN_FINISHED_MS
+    ) {
+      orders.delete(orderNo);
+      continue;
+    }
+    if (order.status !== 'awaiting_payment' || order.settling || order.pending) continue;
     if (now - order.createdAt < ABANDON_AFTER_MS) continue;
 
     order.status = 'cancelled';
     if (MOCK) {
       log('sweep cancelled', orderNo);
+      dwSweepCancel(order, orderNo);
       continue;
     }
     try {
       const result = await qpay.cancelInvoice(order.invoiceId);
+      // Anything after an await must re-check the status it wrote before the
+      // await: a QPay webhook can run settle() to completion while
+      // cancelInvoice is in flight. Writing 'awaiting_payment' over that
+      // settle's 'paid' re-arms settle for the same order — and the machine
+      // brews a second cup for one payment.
       if (result.paid) {
-        order.status = 'awaiting_payment';
-        log('sweep found payment, settling', orderNo);
-        await settle(orderNo);
-      } else {
+        if (order.status === 'cancelled') {
+          order.status = 'awaiting_payment';
+          log('sweep found payment, settling', orderNo);
+          await settle(orderNo);
+        } else {
+          log('sweep: settled concurrently, leaving as', order.status, orderNo);
+        }
+      } else if (order.status === 'cancelled') {
         log('sweep cancelled', orderNo);
-        dw('sweepCancel', async () => {
-          const id = await pgOrderId(order.deviceNo, orderNo);
-          if (id) await store.markCancelled(id);
-        });
+        dwSweepCancel(order, orderNo);
       }
     } catch (err) {
-      order.status = 'awaiting_payment';
+      if (order.status === 'cancelled') order.status = 'awaiting_payment';
       log('sweep failed', orderNo, err.message);
     }
   }
+
+  // Rows whose settle attempts ran out would otherwise vanish from every
+  // worker's WHERE clause — money confirmed, machine never told, nobody's
+  // problem. needs_human at least makes them somebody's problem.
+  dw('giveUpExhausted', () => store.giveUpExhausted());
 }
 
-setInterval(() => sweepAbandoned().catch((e) => log('sweep error', e.message)), 60_000).unref();
+/**
+ * Mirrors a sweep cancellation. mark_cancelled requires the row to be claimed
+ * first (status 'settling'), so this claims, cancels, and releases the claim
+ * if the cancel is refused — a refusal usually means a payment was confirmed
+ * in the meantime, which the release records instead of discarding.
+ */
+function dwSweepCancel(order, orderNo) {
+  dw('sweepCancel', async () => {
+    const id = await pgOrderId(order.deviceNo, orderNo);
+    if (!id) return;
+    const claimed = await store.claimSettle(id, { leaseSeconds: 60, instance: INSTANCE });
+    if (!claimed) return log('dw sweepCancel declined', orderNo, 'claim');
+    if (!(await store.markCancelled(id))) {
+      await store.releaseSettle(id, 'cancel declined (payment confirmed?)');
+    }
+  });
+}
+
+const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS ?? 60_000);
+setInterval(() => sweepAbandoned().catch((e) => log('sweep error', e.message)), SWEEP_INTERVAL_MS).unref();
 
 const port = process.env.PORT ?? 3000;
 app.listen(port, () => log(`listening :${port} mock=${MOCK} qpay=${qpay.qpayConfigured()} public=${PUBLIC_URL}`));

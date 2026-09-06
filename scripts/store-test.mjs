@@ -199,6 +199,74 @@ await check('claimAbandoned picks up an expired unpaid order exactly once', asyn
   return a.concat(b).some((x) => x.id === row.id) && claimedTwice.length === 0;
 });
 
+// ---- 006: the review fixes ----------------------------------------------
+await check('006: a cancelled order whose payment landed late is claimable again', async () => {
+  const no = `C${Date.now()}`;
+  const row = await store.beginOrder({ ...newOrder(no), senderInvoiceNo: no });
+  await store.attachInvoice(row.id, { invoiceId: `inv_${no}`, qrCode: 'https://s.qpay.mn/x' });
+  // Sweep path: claim, cancel — then QPay says INVOICE_PAID after all.
+  await store.claimSettle(row.id, { leaseSeconds: 60, instance: 'sweeper' });
+  await store.markCancelled(row.id);
+  const reclaimed = await store.claimSettle(row.id, { leaseSeconds: 60, instance: 'settler' });
+  if (!reclaimed) return 'cancelled мөрийг claim хийж чадсангүй';
+  await store.markPaymentConfirmed(row.id, { paymentId: `pay_${no}`, paidAmountMnt: 100 });
+  await store.markNotifySent(row.id);
+  await store.finishSettle(row.id);
+  const after = await store.findOrderByMachine(machineId, no);
+  return after.status === 'paid' && after.cancelled_at !== null;
+});
+
+await check('006: an invoice-less creating order fails alone instead of wedging the sweeper', async () => {
+  const stuckNo = `W${Date.now()}`;
+  const goodNo = `G${Date.now()}`;
+  const stuck = await store.beginOrder({ ...newOrder(stuckNo), senderInvoiceNo: stuckNo });
+  const good = await store.beginOrder({ ...newOrder(goodNo), senderInvoiceNo: goodNo });
+  await store.attachInvoice(good.id, { invoiceId: `inv_${goodNo}`, qrCode: 'https://s.qpay.mn/x' });
+  await query(`update public.orders set expires_at = now() - interval '1 hour' where id = any($1::uuid[])`, [
+    [stuck.id, good.id],
+  ]);
+  // Before 006 this whole batch aborted on the constraint and NOTHING was
+  // ever claimed again — the poisoned oldest row was re-selected forever.
+  const claimed = await store.claimAbandoned({ limit: 50, instance: 'sweeper' });
+  const stuckRow = await store.findOrderByMachine(machineId, stuckNo);
+  return (
+    claimed.some((x) => x.id === good.id) &&
+    stuckRow.status === 'failed' &&
+    stuckRow.last_error === 'NO_INVOICE'
+  );
+});
+
+await check('006: productdone is accepted for a needs_human order', async () => {
+  const no = `H${Date.now()}`;
+  const row = await store.beginOrder({ ...newOrder(no), senderInvoiceNo: no });
+  await store.attachInvoice(row.id, { invoiceId: `inv_${no}`, qrCode: 'https://s.qpay.mn/x' });
+  await store.claimSettle(row.id, { leaseSeconds: 60, instance: 'settler' });
+  await store.markPaymentConfirmed(row.id, { paymentId: `pay_${no}`, paidAmountMnt: 100 });
+  await store.giveUp(row.id, 'test: machine unreachable');
+  const done = await store.recordProductDone(row.id, true);
+  const after = await store.findOrderByMachine(machineId, no);
+  return done !== null && after.product_done_at !== null && after.status === 'needs_human';
+});
+
+await check('006: giveUpExhausted flips run-out orders to needs_human', async () => {
+  const no = `E${Date.now()}`;
+  const row = await store.beginOrder({ ...newOrder(no), senderInvoiceNo: no });
+  await store.attachInvoice(row.id, { invoiceId: `inv_${no}`, qrCode: 'https://s.qpay.mn/x' });
+  await query(`update public.orders set settle_attempts = 10 where id = $1`, [row.id]);
+  const n = await store.giveUpExhausted();
+  const after = await store.findOrderByMachine(machineId, no);
+  return n >= 1 && after.status === 'needs_human' && after.last_error === 'SETTLE_ATTEMPTS_EXHAUSTED';
+});
+
+await check('findLiveOrder returns a live row by orderNo and skips finished ones', async () => {
+  const liveNo = `L${Date.now()}`;
+  const row = await store.beginOrder({ ...newOrder(liveNo), senderInvoiceNo: liveNo });
+  await store.attachInvoice(row.id, { invoiceId: `inv_${liveNo}`, qrCode: 'https://s.qpay.mn/x' });
+  const live = await store.findLiveOrder(liveNo);
+  const finished = await store.findLiveOrder(orderNo); // paid earlier in this file
+  return live?.id === row.id && live.notify_url && finished === null;
+});
+
 // ---- ingest errors -------------------------------------------------------
 await check('logIngestError records an unregistered device', async () => {
   await store.logIngestError({

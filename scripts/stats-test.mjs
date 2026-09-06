@@ -201,6 +201,26 @@ await check('шинэ эзэмшигчид тэг үзүүлэлт буцаан�
   );
 });
 
+await check('006: мөнгө нь баталгаажсан ч дуусаагүй захиалга failed-д тоологдоно', async () => {
+  // The worst failure never reaches 'paid': payment confirmed, notify never
+  // finished. It has no notified_at, so it buckets by payment_confirmed_at.
+  await query(
+    `insert into public.orders (
+       machine_id, owner_id, qpay_credential_id, order_no, device_no, notify_url,
+       raw_order_amount, amount_divisor, amount_mnt, paid_amount_mnt,
+       qpay_sender_invoice_no, qpay_invoice_id, callback_url,
+       status, payment_confirmed_at, settle_attempts, last_error)
+     select $1,$2,$3,'STUCK','DEV','http://x/notify',
+            '500000',100,5000,5000,'STUCK','inv_stuck_1','http://x/cb',
+            'needs_human', m.at, 10, 'machine unreachable'
+       from (select ($4::timestamptz - interval '2 hours') as at) m`,
+    [a.machineId, a.ownerId, a.credId, NOW]
+  );
+  const after = await store.ownerStats(a.ownerId, { now: NOW });
+  // 1 paid-but-no-cup (T2) + 1 stuck = 2; the stuck 5000₮ is NOT revenue.
+  return after.failedThisMonth === 2 && after.month.amount === 19050;
+});
+
 await check('төлөгдөөгүй захиалга орлогод ороогүй', async () => {
   await query(
     `insert into public.orders (

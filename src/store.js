@@ -150,6 +150,43 @@ export const markPaymentConfirmed = (orderId, { paymentId, paidAmountMnt, leaseS
     leaseSeconds ?? 60,
   ]);
 
+/**
+ * The restart-recovery read: a live order by its orderNo alone.
+ *
+ * Used only when the in-memory Map has no entry — the process restarted and a
+ * webhook or /check arrived for an order created by the previous life. Only
+ * statuses that can still become a coffee qualify; paid and cancelled rows
+ * stay finished, and a 'creating' row has no invoice to check against.
+ * orderNo is only unique per machine, so ties go to the newest row.
+ */
+export async function findLiveOrder(orderNo) {
+  const { rows } = await query(
+    `select o.* from public.orders o
+      where o.order_no = $1
+        and o.status in ('awaiting_payment','settling','payment_confirmed')
+        and o.qpay_invoice_id is not null
+      order by o.created_at desc
+      limit 1`,
+    [orderNo]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Flips orders whose settle attempts ran out to needs_human (006). Before 006
+ * is applied the function does not exist; that is a missing migration, not a
+ * reason to spam the log every sweep tick — hence the 42883 swallow.
+ */
+export async function giveUpExhausted() {
+  try {
+    const { rows } = await query(`select app.give_up_exhausted() as n`);
+    return rows[0]?.n ?? 0;
+  } catch (err) {
+    if (err.code === '42883') return 0;
+    throw err;
+  }
+}
+
 export const markNotifySent = (orderId) => one(`select * from app.mark_notify_sent($1)`, [orderId]);
 export const finishSettle = (orderId) => one(`select * from app.finish_settle($1)`, [orderId]);
 export const releaseSettle = (orderId, error) =>

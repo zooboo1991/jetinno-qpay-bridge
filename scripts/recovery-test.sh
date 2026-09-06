@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Runs scripts/sms-hook-test.mjs against a throwaway Postgres carrying the real
+# Runs scripts/recovery-test.mjs against a throwaway Postgres carrying the real
 # migrations. Never touches Supabase; needs no production credential.
 set -uo pipefail
 cd ~/Downloads/jetinno-qpay-bridge
 
-PORT=55439
-NAME=jetinno-sms-test
+PORT=55443
+NAME=jetinno-recovery-test
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1; return 0; }
 trap cleanup EXIT
@@ -27,11 +27,11 @@ done
 if [ "$ready" != "1" ]; then echo "  ✗ Postgres 60 секундэд бэлэн болсонгүй"; exit 1; fi
 
 # 000 is the local stub for what a real Supabase project already provides.
-for f in migrations/000_*.sql migrations/001_*.sql migrations/002_*.sql migrations/003_*.sql migrations/004_*.sql migrations/005_*.sql migrations/006_*.sql; do
+for f in migrations/000_*.sql migrations/001_*.sql migrations/002_*.sql migrations/003_*.sql migrations/006_*.sql; do
   if ! docker exec -i "$NAME" psql -U postgres -d bridge -v ON_ERROR_STOP=1 -q < "$f" >/dev/null 2>&1; then
     echo "  ✗ migration failed: $f"
     exit 1
   fi
 done
 
-DATABASE_URL="postgresql://postgres:test@localhost:$PORT/bridge" node scripts/sms-hook-test.mjs
+DATABASE_URL="postgresql://postgres:test@localhost:$PORT/bridge" node scripts/recovery-test.mjs
