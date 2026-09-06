@@ -246,7 +246,29 @@ Supabase дээр: Authentication → Hooks → Send SMS → HTTP,
 үлдэгдэл дуусвал **хоёулаа зогсоно** — gmath-ийн масс илгээлт Coffeine-ий
 нэвтрэлтийг зогсоож болно. `sms_sends` дэх амжилтгүй мөрүүд үүнийг харуулна.
 
-Миграцууд `migrations/` дотор дугаарын дарааллаар. `000_supabase_stub_local_only.sql`
+Миграцууд `migrations/` дотор дугаарын дарааллаар. Аль нь орсныг таахгүй —
+доорх query SQL editor дээр хэлж өгнө:
+
+```sql
+select m.migration, case when m.applied then '✓' else '✗' end as ok
+from (values
+  ('001_core',               to_regclass('public.orders') is not null),
+  ('002_supabase_rls',       to_regclass('public.owner_members') is not null),
+  ('003_owner_self_service', to_regclass('public.owner_invites') is not null),
+  ('004_owner_stats',        exists(select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                                     where n.nspname = 'app' and p.proname = 'owner_stats')),
+  ('005_sms',                to_regclass('public.sms_sends') is not null),
+  ('005 нэмэлт',             exists(select 1 from information_schema.columns
+                                     where table_schema = 'public' and table_name = 'sms_sends'
+                                       and column_name = 'gateway_reply')),
+  ('006_settle_fixes',       exists(select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                                     where n.nspname = 'app' and p.proname = 'give_up_exhausted'))
+) as m(migration, applied);
+```
+
+`migrations/patches/005_gateway_reply.sql` нь 005-ыг 2026-09-05-ны өглөөнөөс
+өмнөх хувилбараар ажиллуулсан санд зориулагдсан — "005 нэмэлт: ✗" гэж гарвал
+ажиллуулна, давхар ажиллуулахад аюулгүй. `000_supabase_stub_local_only.sql`
 нь **зөвхөн локал Docker-т** — Supabase дээр байдаг зүйлийг дуурайдаг тул түүн дээр
 битгий ажиллуул.
 
