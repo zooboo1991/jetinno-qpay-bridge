@@ -18,15 +18,71 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
+
       # sync: false means Render prompts for the value and keeps it out of
       # this file. Never commit a real credential here.
+      #
+      # This list is deliberately COMPLETE. An earlier version held only the
+      # QPay and Jetinno keys, which produced the hardest failure to diagnose:
+      # a bridge that boots, sells coffee on the operator's own merchant, and
+      # silently 404s both /owner/v1 and /hooks because their mount conditions
+      # were never met. Nothing logs an error; the symptom looks like a
+      # routing bug.
+
+      # --- Machine protocol. Without these the process refuses to boot. ---
+      - key: JETINNO_USERNAME
+        sync: false
+      - key: JETINNO_APIKEY
+        sync: false
+
+      # --- The operator's own QPay merchant. Still required after per-owner
+      #     credentials work: it is the fallback for unregistered machines and
+      #     for a database outage. ---
       - key: QPAY_USERNAME
         sync: false
       - key: QPAY_PASSWORD
         sync: false
       - key: QPAY_INVOICE_CODE
         sync: false
-      - key: JETINNO_USERNAME
+
+      # --- Database. This single variable turns on per-owner money routing,
+      #     restart recovery, /owner/v1 and /hooks. Use Supabase's pooler, not
+      #     port 5432: direct is IPv6-only and Render is IPv4. ---
+      - key: DATABASE_URL
         sync: false
-      - key: JETINNO_APIKEY
+
+      # --- Credential sealing. These three must be BYTE-IDENTICAL to the
+      #     laptop that runs scripts/add-owner.js: that script seals, this
+      #     service is the only thing that unseals. A mismatch refuses every
+      #     sale on a registered machine rather than misrouting the money. ---
+      - key: CRED_KEYS
+        sync: false
+      - key: CRED_KEY_ACTIVE
+        sync: false
+      - key: CRED_FP_KEY
+        sync: false
+
+      # --- Owner portal API. SUPABASE_URL is what mounts /owner/v1;
+      #     PORTAL_ORIGIN is compared to the browser's Origin header for exact
+      #     equality, so no trailing slash and no www variant. ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: PORTAL_ORIGIN
+        sync: false
+
+      # --- Login SMS. All of SEND_SMS_HOOK_SECRET, SMS_API_URL and
+      #     SMS_API_KEY are needed before /hooks/send-sms exists at all. The
+      #     SMS_PARAM_* names already default to Skytel Web2SMS's shape, and
+      #     SMS_API_METHOD defaults to POST on purpose — it keeps the login
+      #     code out of URLs on a gateway that has no TLS. ---
+      - key: SEND_SMS_HOOK_SECRET
+        sync: false
+      - key: SMS_API_URL
+        sync: false
+      - key: SMS_API_KEY
+        sync: false
+
+      # --- Diagnostics readable from a phone on site. No key, no endpoint:
+      #     /recent, /orders, /errors and /check all 404. ---
+      - key: DEBUG_KEY
         sync: false
