@@ -32,6 +32,17 @@ QPay клиент нь gmath.mn дээр ажиллаж байгаа холбо�
 cd ~/Downloads/jetinno-qpay-bridge && npm install
 ```
 
+**Бүтэн системийг нэг командаар үзэх:**
+
+```bash
+npm run demo
+```
+
+Гүүр болон дуураймал машиныг асааж, кофе сонгохоос аяга гартал явуулаад, хоёр
+дахь төлбөрийн мэдэгдэлд кофе дахин гардаггүйг харуулна. Дараа нь хоёуланг нь
+асаалттай үлдээдэг тул оношилгооны хуудсуудыг нээж үзэж болно. QPay, Supabase,
+Render, бодит мөнгө — аль нь ч оролцохгүй.
+
 Бүтэн урсгалыг автоматаар шалгах:
 
 ```bash
@@ -40,16 +51,18 @@ npm run test:e2e
 
 Энэ нь сервер + дуурайлган машин хоёрыг асааж, дараах 3 зүйлийг батална: кофе яг нэг удаа гарсан, давтагдсан `getQrCode` шинэ invoice үүсгээгүй, QPay callback `200 SUCCESS` буцаасан.
 
-Гараар турших бол — нэг терминал дээр сервер:
+Гараар турших бол — нэг терминал дээр сервер. `JETINNO_*` хоёрыг заавал өгнө:
+тэдгээргүйгээр сервер зориудаар асахгүй (баримтын жишээ түлхүүр нь нийтийн
+репод үлдсэн байсан тул өгөгдмөл утга байхаа больсон).
 
 ```bash
-PORT=3100 QPAY_MOCK=1 PUBLIC_URL=http://localhost:3100 npm start
+PORT=3100 QPAY_MOCK=1 PUBLIC_URL=http://localhost:3100   JETINNO_USERNAME=testname JETINNO_APIKEY=DBRW17YE7FHKR72T npm start
 ```
 
 Өөр терминал дээр машин:
 
 ```bash
-BRIDGE_URL=http://localhost:3100 npm run simulate
+BRIDGE_URL=http://localhost:3100   JETINNO_USERNAME=testname JETINNO_APIKEY=DBRW17YE7FHKR72T npm run simulate
 ```
 
 Гарч ирсэн `curl .../mock/pay/TEST...` командыг ажиллуулбал төлбөр орсон мэт болж, "машин" кофе гаргана.
