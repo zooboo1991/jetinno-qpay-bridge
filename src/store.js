@@ -260,12 +260,34 @@ export async function logIngestError({ path, deviceNo, orderNo, reason, payload,
 export async function ownersByIds(ownerIds) {
   if (!ownerIds?.length) return [];
   const { rows } = await query(
+    // The credential summary never includes `sealed`, `pending_sealed` or any
+    // key id. The portal needs to know whether the machine can take money and
+    // which account it is pointed at — a masked hint answers both. There is a
+    // public.my_qpay_credentials view for exactly this shape, but it filters
+    // on auth.uid(), and the bridge connects as service_role with no
+    // auth.uid() to read; the owner filter here is the access check instead,
+    // and the caller has already proved membership of these ids.
     `select o.id, o.name, o.status,
-            count(m.id) filter (where m.status = 'active')::int as active_machines
+            count(distinct m.id) filter (where m.status = 'active')::int as active_machines,
+            c.status            as credential_status,
+            c.is_active         as credential_active,
+            c.username_hint     as credential_username_hint,
+            c.last_verified_at  as credential_verified_at,
+            (c.verify_expires_at is not null and c.verify_expires_at > now())
+                                as credential_verification_open
        from public.owners o
        left join public.machines m on m.owner_id = o.id
+       left join lateral (
+         select qc.status, qc.is_active, qc.username_hint,
+                qc.last_verified_at, qc.verify_expires_at
+           from public.qpay_credentials qc
+          where qc.owner_id = o.id
+          order by qc.is_active desc, qc.updated_at desc
+          limit 1
+       ) c on true
       where o.id = any($1::uuid[])
-      group by o.id
+      group by o.id, c.status, c.is_active, c.username_hint,
+               c.last_verified_at, c.verify_expires_at
       order by o.name`,
     [ownerIds]
   );

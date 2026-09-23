@@ -72,8 +72,11 @@ async function seedOwner(name, phone) {
   const machineId = randomUUID();
   await query(`insert into public.owners (id, name, contact_phone) values ($1,$2,$3)`, [ownerId, name, phone]);
   await query(
-    `insert into public.qpay_credentials (id, owner_id, label, sealed, key_id, fingerprint, status, is_active, source)
-     values ($1,$2,'Үндсэн данс','v1.k1.a.b.c','k1',$3,'active',true,'cli')`,
+    // username_hint is set the same way registerOwner sets it — the portal
+    // shows this masked hint and nothing else about the account.
+    `insert into public.qpay_credentials
+       (id, owner_id, label, sealed, key_id, fingerprint, username_hint, status, is_active, source)
+     values ($1,$2,'Үндсэн данс','v1.k1.a.b.c','k1',$3,'cof••••••ne','active',true,'cli')`,
     [credId, ownerId, randomUUID().replace(/-/g, '').padEnd(64, '0')]
   );
   await query(
@@ -330,6 +333,31 @@ await check('/me нь удирддаг компаниудаа жагсаана',
     r.status === 200 &&
     r.json.owners.length === 2 &&
     r.json.owners.every((o) => o.active_machines === 1)
+  );
+});
+
+await check('/me нь QPay дансны ТӨЛӨВИЙГ хэлнэ — портал үүгээр самбараа шийднэ', async () => {
+  const r = await call('/owner/v1/me', { token: await mint({ sub: userAlpha }) });
+  const o = r.json.owners[0];
+  return (
+    o.credential_status === 'active' &&
+    o.credential_active === true &&
+    typeof o.credential_username_hint === 'string' &&
+    'credential_verification_open' in o
+  );
+});
+
+await check('/me битүүмжилсэн нууц үгийг ХЭЗЭЭ Ч задруулахгүй', async () => {
+  const r = await call('/owner/v1/me', { token: await mint({ sub: userBoth }) });
+  const blob = r.text;
+  // The sealed blob, the key id and the raw username are all absent by
+  // construction: the query names its columns. Asserted anyway, because the
+  // cost of a future `select *` here is every owner's QPay password.
+  return (
+    !blob.includes('sealed') &&
+    !blob.includes('v1.k1') &&
+    !blob.includes('key_id') &&
+    !blob.includes('pending')
   );
 });
 

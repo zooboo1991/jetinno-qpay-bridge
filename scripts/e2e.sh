@@ -7,9 +7,21 @@ B=http://localhost:$PORT
 LOG=$(mktemp -d)
 ORDER=TESTRUN$RANDOM
 
+# Freed by port as well as by name. `npm run demo` leaves a bridge on 3100 on
+# purpose — it is meant to stay up so the diagnostic pages can be opened — and
+# without this the next e2e run dies on EADDRINUSE with a stack trace that
+# looks nothing like "something else is already listening".
+freeport() {
+  local pids
+  pids=$(lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null)
+  [ -n "$pids" ] && kill -9 $pids 2>/dev/null
+  return 0
+}
 cleanup() {
   pkill -f "node src/server.js" 2>/dev/null
   pkill -f "node src/simulate-machine.js" 2>/dev/null
+  freeport 3100
+  freeport 4000
   return 0
 }
 trap cleanup EXIT
