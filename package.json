@@ -16,7 +16,8 @@
     "test:sms": "bash scripts/sms-hook-test.sh",
     "test:recovery": "bash scripts/recovery-test.sh",
     "test:tenant": "bash scripts/tenant-test.sh",
-    "test:cache": "bash scripts/cache-test.sh"
+    "test:cache": "bash scripts/cache-test.sh",
+    "preflight": "node --env-file=.env scripts/preflight.mjs"
   },
   "engines": {
     "node": ">=20"
