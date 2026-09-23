@@ -107,12 +107,15 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
    * disagrees with the expiry we computed. One evict-and-retry heals it;
    * without this, a revoked token fails every sale until a process restart.
    */
-  async function authed(path, init, timeoutMs) {
+  async function authed(path, init, timeoutMs, signal) {
     const attempt = async (force) =>
       fetch(`${base()}${path}`, {
         ...init,
         headers: { ...init.headers, Authorization: `Bearer ${await accessToken(force)}` },
-        signal: AbortSignal.timeout(timeoutMs),
+        // A caller-supplied signal wins. The machine path has Jetinno's
+        // 8-second budget and uses the defaults; the credential path is a
+        // human on a phone and sets its own, longer, deadlines.
+        signal: signal ?? AbortSignal.timeout(timeoutMs),
       });
     let res = await attempt(false);
     if (res.status === 401) {
@@ -124,24 +127,62 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
 
   return {
     /**
+     * Proves the credential can authenticate, without creating anything.
+     *
+     * The credential-verification flow needs to distinguish "wrong password"
+     * from "wrong invoice code", and only a token call on its own can do
+     * that: a failed invoice call could be either.
+     */
+    async warmToken(signal) {
+      const basic = Buffer.from(`${username}:${password}`).toString('base64');
+      const res = await fetch(`${base()}/v2/auth/token`, {
+        method: 'POST',
+        headers: { Authorization: `Basic ${basic}` },
+        signal: signal ?? AbortSignal.timeout(TIMEOUT_MS.token),
+      });
+      if (!res.ok) {
+        const err = new Error(`qpay auth ${res.status}: ${await detail(res)}`);
+        err.stage = 'auth';
+        err.status = res.status;
+        throw err;
+      }
+      const json = await res.json();
+      const asDurationMs = Number(json.expires_in) * 1000;
+      const now = Date.now();
+      const expiresAtMs = !Number.isFinite(asDurationMs)
+        ? now + 60 * 60 * 1000
+        : asDurationMs > 1000 * 60 * 60 * 24 * 120
+          ? asDurationMs
+          : now + asDurationMs;
+      tokenCaches.set(key, { accessToken: json.access_token, expiresAtMs });
+      return true;
+    },
+
+    /**
      * `senderInvoiceNo` must be unique for this merchant forever — QPay
      * rejects a repeat. The machine's orderNo satisfies that; a counter
-     * would not.
+     * would not. The credential probe passes its own, deliberately shaped so
+     * it can never be mistaken for a sale's.
      */
-    async createInvoice({ orderNo, amount, description, callbackUrl }) {
+    async createInvoice({ orderNo, senderInvoiceNo, amount, description, callbackUrl, signal }) {
       const res = await authed('/v2/invoice', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           invoice_code: invoiceCode,
-          sender_invoice_no: orderNo,
+          sender_invoice_no: senderInvoiceNo ?? orderNo,
           invoice_receiver_code: 'terminal',
           invoice_description: description,
           amount,
           callback_url: callbackUrl,
         }),
-      }, TIMEOUT_MS.invoice);
-      if (!res.ok) throw new Error(`qpay invoice ${res.status}: ${await detail(res)}`);
+      }, TIMEOUT_MS.invoice, signal);
+      if (!res.ok) {
+        const err = new Error(`qpay invoice ${res.status}: ${await detail(res)}`);
+        err.stage = 'invoice';
+        err.status = res.status;
+        throw err;
+      }
 
       const json = await res.json();
       return {
@@ -195,8 +236,8 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
      * swallowed: it means the customer did pay, and the caller has to settle
      * instead of voiding.
      */
-    async cancelInvoice(invoiceId) {
-      const res = await authed(`/v2/invoice/${invoiceId}`, { method: 'DELETE' }, TIMEOUT_MS.cancel);
+    async cancelInvoice(invoiceId, signal) {
+      const res = await authed(`/v2/invoice/${invoiceId}`, { method: 'DELETE' }, TIMEOUT_MS.cancel, signal);
       if (res.ok || res.status === 404) return { cancelled: true };
 
       const text = await detail(res);
@@ -215,6 +256,34 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
 export function clientFor({ username, password, invoiceCode, cacheKey }) {
   if (!username || !password || !invoiceCode) throw new Error('QPAY_CREDENTIAL_INCOMPLETE');
   return makeClient({ username, password, invoiceCode, cacheKey });
+}
+
+/**
+ * The credential-flow's entry point. Same client, keyed by credential id so a
+ * candidate merchant being verified never shares a token cache with the one
+ * currently taking that owner's money.
+ */
+export function forOwner({ ownerId, credentialId, username, password, invoiceCode }) {
+  if (!username || !password || !invoiceCode) throw new Error('QPAY_CREDENTIAL_INCOMPLETE');
+  return makeClient({
+    username,
+    password,
+    invoiceCode,
+    cacheKey: credentialId ? `cred:${credentialId}` : `owner:${ownerId}`,
+  });
+}
+
+/**
+ * Forgets every cached token for an owner after their merchant changes.
+ *
+ * Keyed by credential id, so the sweep is over the whole map: the credential
+ * that was just replaced is exactly the one whose id the caller may not have.
+ * A handful of entries, cleared on an event that happens a few times in the
+ * life of a machine — the cost is irrelevant next to selling on a merchant
+ * the owner just disconnected.
+ */
+export function evictOwner() {
+  tokenCaches.clear();
 }
 
 /*

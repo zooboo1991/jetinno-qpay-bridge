@@ -293,3 +293,249 @@ export async function ownersByIds(ownerIds) {
   );
   return rows;
 }
+
+// ===========================================================================
+// Owner self-service credentials (migration 003).
+//
+// Thin wrappers, one per SQL function. The authorisation for every one of
+// these lives in SQL — each takes p_actor_user_id and checks admin membership
+// on the credential's OWN owner_id — so nothing here may "helpfully" resolve
+// an owner on the caller's behalf. Passing an owner id these functions did not
+// derive themselves would move the access check into JavaScript, which is
+// exactly what migration 003 was written to avoid.
+// ===========================================================================
+
+/** Redeems an invite token, creating the owner_members row. */
+export async function acceptOwnerInvite(token, userId, sourceIp) {
+  const { rows } = await query(`select * from app.accept_owner_invite($1, $2, $3::inet)`, [
+    token,
+    userId,
+    sourceIp ?? null,
+  ]);
+  return rows[0] ?? { out_status: 'not_found' };
+}
+
+/** The credential slot the owner is about to fill, with the admin check applied. */
+export async function credentialSlot(credentialId, actorUserId) {
+  const { rows } = await query(`select * from app.credential_slot($1, $2)`, [
+    credentialId,
+    actorUserId,
+  ]);
+  return rows[0] ?? null;
+}
+
+/** Rate limit. Counts only attempts that actually reached QPay. */
+export async function credentialVerifyBudget(ownerId, usernameFp, limits = {}) {
+  const { rows } = await query(`select * from app.credential_verify_budget($1,$2,$3,$4,$5,$6,$7)`, [
+    ownerId,
+    usernameFp,
+    limits.perHour ?? 5,
+    limits.perDay ?? 20,
+    limits.distinctUsernamesPerDay ?? 2,
+    limits.lockFails ?? 5,
+    limits.lockMinutes ?? 60,
+  ]);
+  return rows[0] ?? { out_allowed: false, out_reason: 'UNAVAILABLE', out_retry_minutes: 60 };
+}
+
+export async function recordVerifyAttempt({
+  ownerId,
+  credentialId,
+  actorUserId,
+  usernameFp,
+  outcome,
+  remoteIp,
+  userAgent,
+}) {
+  await query(`select app.record_verify_attempt($1,$2,$3,$4,$5,$6::inet,$7)`, [
+    ownerId,
+    credentialId,
+    actorUserId,
+    usernameFp,
+    outcome,
+    remoteIp ?? null,
+    userAgent ?? null,
+  ]);
+}
+
+/** Circuit breaker: auth failures across ALL owners, for the last N minutes. */
+export async function globalAuthFails(minutes = 10) {
+  const { rows } = await query(`select app.global_auth_fails($1) as n`, [minutes]);
+  return rows[0]?.n ?? 0;
+}
+
+export async function recordVerifyFailure(credentialId, actorUserId, failureCode, remoteIp, userAgent) {
+  const { rows } = await query(`select app.record_verify_failure($1,$2,$3,$4::inet,$5) as ok`, [
+    credentialId,
+    actorUserId,
+    failureCode,
+    remoteIp ?? null,
+    userAgent ?? null,
+  ]);
+  return rows[0]?.ok ?? false;
+}
+
+/**
+ * Has this owner ever had a credential with this merchant fingerprint?
+ *
+ * Distinguishes "you mistyped your password" from "that is a different QPay
+ * account" — the first is a retry, the second is a question worth asking
+ * before an owner's revenue moves.
+ */
+export async function usernameFpEverConfigured(ownerId, usernameFp) {
+  const { rows } = await query(
+    `select exists (
+       select 1 from public.qpay_credentials c
+        where c.owner_id = $1
+          and (c.fingerprint = $2 or c.pending_fingerprint = $2)
+     ) as seen`,
+    [ownerId, usernameFp]
+  );
+  return rows[0]?.seen ?? false;
+}
+
+/** Stages the sealed candidate in pending_*; the live credential keeps serving. */
+export async function beginCredentialVerification({
+  credentialId,
+  actorUserId,
+  sealed,
+  keyId,
+  fp,
+  usernameHint,
+  invoiceCodeHint,
+  nonce,
+  invoiceId,
+  ttlMinutes,
+  remoteIp,
+  xff,
+  userAgent,
+}) {
+  const { rows } = await query(
+    `select * from app.begin_credential_verification(
+       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::inet,$12,$13)`,
+    [
+      credentialId,
+      actorUserId,
+      sealed,
+      keyId,
+      fp,
+      usernameHint,
+      invoiceCodeHint,
+      nonce,
+      invoiceId,
+      ttlMinutes ?? 20,
+      remoteIp ?? null,
+      xff ?? null,
+      userAgent ?? null,
+    ]
+  );
+  return rows[0] ?? { out_status: 'not_found' };
+}
+
+/** The nonce the owner read out of their own QPay portal. Promotes on success. */
+export async function confirmCredentialVerification({
+  credentialId,
+  actorUserId,
+  nonce,
+  remoteIp,
+  xff,
+  userAgent,
+}) {
+  const { rows } = await query(
+    `select * from app.confirm_credential_verification($1,$2,$3,$4::inet,$5,$6)`,
+    [credentialId, actorUserId, nonce, remoteIp ?? null, xff ?? null, userAgent ?? null]
+  );
+  return rows[0] ?? { out_status: 'not_found' };
+}
+
+/** Discards the staged candidate. actorUserId may be null for the sweeper. */
+export async function abortCredentialVerification(credentialId, actorUserId, reason) {
+  const { rows } = await query(`select * from app.abort_credential_verification($1,$2,$3)`, [
+    credentialId,
+    actorUserId ?? null,
+    reason,
+  ]);
+  return rows[0] ?? { out_status: 'not_found' };
+}
+
+export async function setCredentialActive(credentialId, actorUserId, active) {
+  const { rows } = await query(`select * from app.set_credential_active($1,$2,$3)`, [
+    credentialId,
+    actorUserId,
+    active,
+  ]);
+  return rows[0] ?? { out_ok: false, out_affected_machines: 0 };
+}
+
+/** Records that this user just proved possession of their phone. */
+export async function touchStepUp(userId, source) {
+  await query(`select app.touch_step_up($1, $2)`, [userId, source]);
+}
+
+/** Seconds since that proof, or null if there has never been one. */
+export async function stepUpAgeSeconds(userId) {
+  const { rows } = await query(`select app.step_up_age_seconds($1) as s`, [userId]);
+  return rows[0]?.s ?? null;
+}
+
+/** One credential, for the owner's own screen. Never the sealed blob. */
+export async function credentialForOwner(credentialId, actorUserId) {
+  const { rows } = await query(
+    `select c.id, c.owner_id, c.label, c.status, c.is_active,
+            c.username_hint, c.invoice_code_hint, c.source,
+            c.last_verified_at, c.last_error_code, c.auth_fail_count,
+            c.configured_at, c.acceptance_confirmed_at,
+            (c.verify_expires_at is not null and c.verify_expires_at > now()) as verification_open
+       from public.qpay_credentials c
+      where c.id = $1
+        and c.owner_id = any (app.admin_owner_ids_of($2))`,
+    [credentialId, actorUserId]
+  );
+  return rows[0] ?? null;
+}
+
+/** Staged verifications past their TTL, for the sweeper to abort. */
+export async function expiredVerifications(limit = 20) {
+  const { rows } = await query(
+    `select c.id, c.owner_id, c.verify_invoice_id
+       from public.qpay_credentials c
+      where c.verify_expires_at is not null
+        and c.verify_expires_at < now()
+      order by c.verify_expires_at
+      limit $1`,
+    [limit]
+  );
+  return rows;
+}
+
+/**
+ * Append-only note on a credential's timeline, for events with no SQL
+ * function of their own — a verification invoice that could not be cancelled,
+ * for instance. Never carries a secret: the caller passes named scalars.
+ */
+export async function logCredentialEvent(credentialId, action, detail = {}) {
+  await query(
+    `insert into public.credential_audit (credential_id, owner_id, action, detail)
+     select $1, c.owner_id, $2, $3::jsonb
+       from public.qpay_credentials c where c.id = $1`,
+    [credentialId, action, JSON.stringify(detail)]
+  );
+}
+
+/**
+ * Signs the user out everywhere else after their merchant account changes.
+ *
+ * Supabase owns the session table, and the bridge connects as service_role,
+ * so this is a direct delete of that user's other refresh tokens. If the
+ * schema is not reachable the change still stands — this is defence after the
+ * fact, not the gate — so a failure is swallowed by the caller.
+ */
+export async function revokeOtherSessions(userId) {
+  await query(`update auth.refresh_tokens set revoked = true where user_id = $1::text`, [userId]);
+}
+
+/** The number on the sales paperwork — the one a credential-change alert goes to. */
+export async function ownerContactPhone(ownerId) {
+  const { rows } = await query(`select contact_phone from public.owners where id = $1`, [ownerId]);
+  return rows[0]?.contact_phone ?? null;
+}

@@ -4,6 +4,7 @@ import * as qpay from './qpay.js';
 import * as db from './db.js';
 import * as store from './store.js';
 import { ownerApi, authConfigured } from './owner-api.js';
+import * as owners from './owners.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
 import { open, credentialAad } from './crypto.js';
 import { timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
@@ -197,7 +198,11 @@ async function merchantFor(deviceNo, orderNo) {
 
   let machine;
   try {
-    machine = await store.resolveMachine(deviceNo);
+    // Through the 60-second cache: this is the same three-table join for
+    // every cup, inside Jetinno's 8-second budget, and the answer changes a
+    // few times in the life of a machine. The cache is invalidated the
+    // moment a credential is promoted.
+    machine = await owners.resolveMachine(deviceNo);
   } catch (err) {
     log('merchant resolve failed, env fallback', deviceNo, err.message.split('\n')[0]);
     return { client: null, source: 'env-db-down' };
@@ -702,6 +707,43 @@ if (authHookConfigured() && DUAL_WRITE) {
   log('send-sms hook NOT mounted', `secret+gateway=${authHookConfigured()} db=${DUAL_WRITE}`);
 }
 
+/*
+ * Owner self-service credentials — the only network path that ever sees a
+ * plaintext QPay merchant password.
+ *
+ * Mounted last among the owner routes and behind its own conditions, because
+ * it needs more than they do: a Supabase project to verify tokens against, a
+ * database, and a PORTAL_ORIGIN to accept a browser POST from. It also reads
+ * those at module load and throws without them, so the import itself is
+ * deferred rather than risk taking the machine path down with it.
+ *
+ * Loaded dynamically for that reason alone: a top-level import of a module
+ * that throws on a missing env var would stop this process from booting, and
+ * this process is what sells coffee.
+ */
+if (authConfigured() && DUAL_WRITE && process.env.PORTAL_ORIGIN) {
+  try {
+    const { default: credentialsRouter, mountVerifyCallback, sweepAbandonedVerifications } =
+      await import('./credentials.js');
+    app.use('/owner/v1', credentialsRouter);
+    mountVerifyCallback(app);
+    // Verification invoices are 10₮ and live on the owner's own merchant. An
+    // abandoned one is a trivial loss; an untracked one is not.
+    setInterval(
+      () => sweepAbandonedVerifications().catch((e) => log('verify sweep error', e.message.split('\n')[0])),
+      5 * 60_000
+    ).unref();
+    log('credentials api mounted');
+  } catch (err) {
+    log('credentials api FAILED to mount', err.message.split('\n')[0]);
+  }
+} else {
+  log(
+    'credentials api NOT mounted',
+    `supabase=${authConfigured()} db=${DUAL_WRITE} portalOrigin=${Boolean(process.env.PORTAL_ORIGIN)}`
+  );
+}
+
 // Debug endpoints are gated behind DEBUG_KEY: the log ring includes expected
 // signatures on SIGN_ERROR, and handing those out publicly would let anyone
 // forge a valid request in one round trip. No key configured — no endpoint.
@@ -791,6 +833,9 @@ app.get('/health', (req, res) =>
     dbConfigured: DUAL_WRITE,
     dwFailed,
     dwLastFailure,
+    // A hit rate near zero says the TTL is shorter than the gap between
+    // sales, i.e. the cache is costing a lookup and buying nothing.
+    ownerCache: DUAL_WRITE ? owners.cacheStats() : null,
     publicUrl: PUBLIC_URL,
     orders: orders.size,
   })

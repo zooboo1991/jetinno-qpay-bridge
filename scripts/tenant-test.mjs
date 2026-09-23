@@ -124,6 +124,10 @@ const BRIDGE_ENV = {
   QPAY_PASSWORD: 'op-pass',
   QPAY_INVOICE_CODE: 'INV_OPERATOR',
   ALLOW_PRIVATE_NOTIFY: '1',
+  // This file tests WHERE the money goes, not caching. The owner cache is
+  // exercised on its own in scripts/cache-test.mjs; leaving it on here would
+  // mean every status change in this file raced a 60-second TTL.
+  OWNER_CACHE_TTL_MS: '0',
 };
 delete BRIDGE_ENV.QPAY_MOCK;
 
