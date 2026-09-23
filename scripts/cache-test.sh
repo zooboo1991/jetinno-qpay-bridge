@@ -26,8 +26,12 @@ for _ in $(seq 1 60); do
 done
 if [ "$ready" != "1" ]; then echo "  ✗ Postgres 60 секундэд бэлэн болсонгүй"; exit 1; fi
 
+# Every migration, in order. A glob rather than a list: the list was copied
+# between six test harnesses and a new migration reached some of them and not
+# others, which surfaces as "function does not exist" in whichever test was
+# written last. patches/ is a directory and is deliberately not matched.
 # 000 is the local stub for what a real Supabase project already provides.
-for f in migrations/000_*.sql migrations/001_*.sql migrations/002_*.sql migrations/003_*.sql migrations/006_*.sql; do
+for f in migrations/0*.sql; do
   if ! docker exec -i "$NAME" psql -U postgres -d bridge -v ON_ERROR_STOP=1 -q < "$f" >/dev/null 2>&1; then
     echo "  ✗ migration failed: $f"
     exit 1

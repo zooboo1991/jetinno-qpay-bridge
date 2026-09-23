@@ -126,6 +126,13 @@ await addUser(userAlpha, alpha.ownerId, 'admin');
 await addUser(userBoth, alpha.ownerId, 'admin');
 await addUser(userBoth, beta.ownerId, 'admin');
 await addUser(userViewer, alpha.ownerId, 'viewer');
+
+// An operator: runs the business, sees every owner. Deliberately NOT a member
+// of any owner — operator access and owner access are separate powers, and a
+// test where the same person has both cannot tell them apart.
+const userOperator = randomUUID();
+await query(`insert into auth.users (id, phone) values ($1,'99110007') on conflict do nothing`, [userOperator]);
+await query(`insert into public.operators (user_id, label) values ($1, 'Тест оператор')`, [userOperator]);
 await query(`insert into auth.users (id, phone) values ($1,'99110009') on conflict do nothing`, [userNobody]);
 
 await sale(alpha, 4000);
@@ -359,6 +366,54 @@ await check('/me битүүмжилсэн нууц үгийг ХЭЗЭЭ Ч за
     !blob.includes('key_id') &&
     !blob.includes('pending')
   );
+});
+
+// ---- the operator console ------------------------------------------------
+await check('оператор /admin/v1/overview-г уншина', async () => {
+  const r = await call('/admin/v1/overview', { token: await mint({ sub: userOperator }) });
+  return (
+    r.status === 200 &&
+    typeof r.json.machines?.total === 'number' &&
+    typeof r.json.month?.amount === 'number'
+  );
+});
+
+await check('оператор БҮХ эзэмшигчийн орлогыг харна', async () => {
+  const r = await call('/admin/v1/owners', { token: await mint({ sub: userOperator }) });
+  const names = (r.json.owners ?? []).map((o) => o.owner_name);
+  return r.status === 200 && names.includes('Альфа ХХК') && names.includes('Бета ХХК');
+});
+
+await check('ЭНГИЙН эзэмшигч /admin/v1 руу орж ЧАДАХГҮЙ', async () => {
+  // userAlpha administers a real business and reads /owner/v1 happily. That
+  // must buy exactly nothing here: owning a machine is not running the
+  // company, and this is the boundary that keeps one customer out of another
+  // customer's revenue.
+  const token = await mint({ sub: userAlpha });
+  const paths = ['/admin/v1/overview', '/admin/v1/owners', '/admin/v1/machines', '/admin/v1/problems'];
+  const codes = [];
+  for (const p of paths) codes.push((await call(p, { token })).status);
+  return codes.every((c) => c === 401);
+});
+
+await check('оператор бол өөрөө эзэмшигч биш ч бүгдийг харна', async () => {
+  // The operator is a member of no owner at all, so /owner/v1 refuses them —
+  // which proves the two powers are genuinely separate rather than one being
+  // a superset of the other by accident.
+  const token = await mint({ sub: userOperator });
+  const owner = await call('/owner/v1/stats', { token });
+  const admin = await call('/admin/v1/machines', { token });
+  return owner.status === 401 && admin.status === 200;
+});
+
+await check('тулгах хуулга ownerId-гүйгээр бүх мөрийг өгөхгүй', async () => {
+  const r = await call('/admin/v1/reconciliation', { token: await mint({ sub: userOperator }) });
+  return r.status === 200 && r.json.rows?.length === 0 && r.json.error;
+});
+
+await check('админы хариу кэшлэгдэхгүй', async () => {
+  const r = await call('/admin/v1/overview', { token: await mint({ sub: userOperator }) });
+  return (r.headers.get('cache-control') ?? '').includes('no-store');
 });
 
 // ---- transport rules -----------------------------------------------------

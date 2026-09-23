@@ -539,3 +539,113 @@ export async function ownerContactPhone(ownerId) {
   const { rows } = await query(`select contact_phone from public.owners where id = $1`, [ownerId]);
   return rows[0]?.contact_phone ?? null;
 }
+
+// ===========================================================================
+// Operator console (migration 007).
+//
+// Every function here reads EVERY owner's revenue. The operator check lives
+// in SQL — each takes the actor's user id and verifies membership of
+// public.operators itself — so these wrappers deliberately do no checking of
+// their own. Adding one here would create a second place the rule lives, and
+// the two would drift.
+// ===========================================================================
+
+const operatorArgs = (actorUserId, { timezone, now } = {}) => [
+  actorUserId,
+  timezone ?? 'Asia/Ulaanbaatar',
+  now ?? null,
+];
+
+/** The one-screen answer. Null when the caller is not an operator. */
+export async function operatorOverview(actorUserId, opts) {
+  const { rows } = await query(
+    `select app.operator_overview($1, $2, coalesce($3::timestamptz, now())) as j`,
+    operatorArgs(actorUserId, opts)
+  );
+  return rows[0]?.j ?? null;
+}
+
+export async function operatorOwners(actorUserId, opts) {
+  const { rows } = await query(
+    `select * from app.operator_owners($1, $2, coalesce($3::timestamptz, now()))`,
+    operatorArgs(actorUserId, opts)
+  );
+  return rows;
+}
+
+export async function operatorMachines(actorUserId, opts) {
+  const { rows } = await query(
+    `select * from app.operator_machines($1, $2, coalesce($3::timestamptz, now()))`,
+    operatorArgs(actorUserId, opts)
+  );
+  return rows;
+}
+
+export async function operatorProblems(actorUserId, { limit } = {}) {
+  const { rows } = await query(`select * from app.operator_problems($1, $2, now())`, [
+    actorUserId,
+    Math.min(Math.max(Number(limit) || 50, 1), 200),
+  ]);
+  return rows;
+}
+
+export async function operatorHourly(actorUserId, { days, ownerId, machineId, timezone } = {}) {
+  const { rows } = await query(
+    `select * from app.operator_hourly($1, $2, $3::uuid, $4, now(), $5::uuid)`,
+    [
+      actorUserId,
+      Math.min(Math.max(Number(days) || 30, 1), 365),
+      ownerId ?? null,
+      timezone ?? 'Asia/Ulaanbaatar',
+      machineId ?? null,
+    ]
+  );
+  return rows;
+}
+
+export async function operatorFunnel(actorUserId, { days, ownerId, timezone } = {}) {
+  const { rows } = await query(
+    `select * from app.operator_funnel($1, $2, $3::uuid, $4, now())`,
+    [
+      actorUserId,
+      Math.min(Math.max(Number(days) || 30, 1), 365),
+      ownerId ?? null,
+      timezone ?? 'Asia/Ulaanbaatar',
+    ]
+  );
+  return rows;
+}
+
+export async function operatorProducts(actorUserId, { days, ownerId } = {}) {
+  const { rows } = await query(`select * from app.operator_products($1, $2, $3::uuid, now())`, [
+    actorUserId,
+    Math.min(Math.max(Number(days) || 30, 1), 365),
+    ownerId ?? null,
+  ]);
+  return rows;
+}
+
+export async function operatorOnboarding(actorUserId) {
+  const { rows } = await query(`select * from app.operator_onboarding($1)`, [actorUserId]);
+  return rows;
+}
+
+/** The line-by-line statement an owner holds against their QPay export. */
+export async function operatorReconciliation(actorUserId, { ownerId, from, to, timezone }) {
+  const { rows } = await query(
+    `select * from app.operator_reconciliation($1, $2::uuid, $3::timestamptz, $4::timestamptz, $5)`,
+    [actorUserId, ownerId, from, to, timezone ?? 'Asia/Ulaanbaatar']
+  );
+  return rows;
+}
+
+/** True when this user is in public.operators. */
+export async function isOperator(userId) {
+  const { rows } = await query(`select app.is_operator_user($1) as ok`, [userId]);
+  return rows[0]?.ok === true;
+}
+
+/** Stamped on every signed machine request; throttled to once a minute in SQL. */
+export async function touchMachineSeen(deviceNo) {
+  await query(`select app.touch_machine_seen($1)`, [deviceNo]);
+}

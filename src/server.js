@@ -4,6 +4,7 @@ import * as qpay from './qpay.js';
 import * as db from './db.js';
 import * as store from './store.js';
 import { ownerApi, authConfigured } from './owner-api.js';
+import { adminApi } from './admin-api.js';
 import * as owners from './owners.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
 import { open, credentialAad } from './crypto.js';
@@ -381,6 +382,12 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
     log('getQrCode ->', orderNo, `${amount}₮`, qrCode);
     respond(res, { deviceNo, orderNo, qrCode }, SIGNABLE.getQrCodeResponse);
 
+    // machines.last_seen_at has existed since 001 and nothing wrote it. It is
+    // the only signal that separates a machine standing in a quiet lobby from
+    // one that is unplugged — "last sale" conflates the two and the operator
+    // ends up phoning the wrong customer. Throttled to once a minute in SQL.
+    dw('touchSeen', () => store.touchMachineSeen(deviceNo));
+
     dw('beginOrder', async () => {
       // merchantFor already resolved (and logged the unregistered case).
       const machine = merchant.machine ?? (await store.resolveMachine(deviceNo));
@@ -690,8 +697,16 @@ if (MOCK) app.all('/mock/pay/:orderNo', settleRoute);
 if (authConfigured() && DUAL_WRITE) {
   app.use('/owner/v1', ownerApi({ log, portalOrigin: process.env.PORTAL_ORIGIN ?? '' }));
   log('owner api mounted', process.env.PORTAL_ORIGIN ? `origin=${process.env.PORTAL_ORIGIN}` : 'origin=(unset)');
+
+  // The operator console. Same conditions as the owner API — it reads the
+  // same database through the same verified token — but every response
+  // crosses every tenant boundary, so the router checks operator membership
+  // before any handler runs AND every SQL function it calls checks again.
+  app.use('/admin/v1', adminApi({ log, portalOrigin: process.env.PORTAL_ORIGIN ?? '' }));
+  log('admin api mounted');
 } else {
   log('owner api NOT mounted', `supabase=${authConfigured()} db=${DUAL_WRITE}`);
+  log('admin api NOT mounted', `supabase=${authConfigured()} db=${DUAL_WRITE}`);
 }
 
 /*

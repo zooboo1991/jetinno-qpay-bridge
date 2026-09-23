@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Runs scripts/owner-api-test.mjs against a throwaway Postgres carrying the real
+# Runs scripts/operator-test.mjs against a throwaway Postgres carrying the real
 # migrations. Never touches Supabase; needs no production credential.
 set -uo pipefail
 cd ~/Downloads/jetinno-qpay-bridge
 
-PORT=55437
-NAME=jetinno-owner-api-test
+PORT=55450
+NAME=jetinno-operator-test
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1; return 0; }
 trap cleanup EXIT
@@ -38,4 +38,4 @@ for f in migrations/0*.sql; do
   fi
 done
 
-DATABASE_URL="postgresql://postgres:test@localhost:$PORT/bridge" node scripts/owner-api-test.mjs
+DATABASE_URL="postgresql://postgres:test@localhost:$PORT/bridge" node scripts/operator-test.mjs

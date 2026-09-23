@@ -17,7 +17,8 @@
     "test:recovery": "bash scripts/recovery-test.sh",
     "test:tenant": "bash scripts/tenant-test.sh",
     "test:cache": "bash scripts/cache-test.sh",
-    "preflight": "node --env-file=.env scripts/preflight.mjs"
+    "preflight": "node --env-file=.env scripts/preflight.mjs",
+    "test:operator": "bash scripts/operator-test.sh"
   },
   "engines": {
     "node": ">=20"
