@@ -67,6 +67,36 @@ await query(
 );
 await query(`insert into public.operators (user_id, label) values ($1,'Тест оператор')`, [OPERATOR]);
 
+// ---- a stand-in QPay: the operator path proves credentials against it -----
+const QPAY_PORT = 4597;
+const qpayCalls = { token: 0, invoice: [], cancelled: [] };
+const qpayFake = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (d) => (raw += d));
+  req.on('end', () => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/v2/auth/token') {
+      qpayCalls.token += 1;
+      const [, pass] = Buffer.from((req.headers.authorization ?? '').replace(/^Basic /, ''), 'base64').toString().split(':');
+      if (pass === 'wrong-pass') { res.statusCode = 401; return res.end('{"error":"NO_CREDENTIALS"}'); }
+      return res.end(JSON.stringify({ access_token: `tok-${Date.now()}`, expires_in: 3600, refresh_token: 'r' }));
+    }
+    if (req.url === '/v2/invoice' && req.method === 'POST') {
+      const body = JSON.parse(raw || '{}');
+      qpayCalls.invoice.push(body);
+      if (body.invoice_code === 'BAD_CODE') { res.statusCode = 400; return res.end('{"error":"INVOICE_CODE_INVALID"}'); }
+      return res.end(JSON.stringify({ invoice_id: `inv-${qpayCalls.invoice.length}`, qPay_shortUrl: 'https://s.qpay.mn/x' }));
+    }
+    if (req.url.startsWith('/v2/invoice/') && req.method === 'DELETE') {
+      qpayCalls.cancelled.push(req.url.split('/').pop());
+      return res.end('{}');
+    }
+    res.statusCode = 404;
+    res.end('{}');
+  });
+});
+await new Promise((r) => qpayFake.listen(QPAY_PORT, '127.0.0.1', r));
+
 // ---- boot the bridge -------------------------------------------------------
 const PORT = 3197;
 const key = () => randomBytes(32).toString('base64');
@@ -84,6 +114,7 @@ const bridge = spawn(process.execPath, ['src/server.js'], {
     CRED_KEY_ACTIVE: 'k1',
     CRED_FP_KEY: key(),
     CRED_ALLOW_HTTP: '1',
+    QPAY_BASE_URL: `http://127.0.0.1:${QPAY_PORT}`,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -340,8 +371,75 @@ await check('утсыг жагсаалтаас хасахад эрх тэр да
   return r.status === 401;
 });
 
+// ---- the operator configures an owner's QPay (migration 010) -------------------
+const creds = (extra = {}) => ({
+  username: 'shinekofe', password: 'Merchant-Pass-9', invoiceCode: 'SHINE_INV_01', confirmOwnership: true, ...extra,
+});
+const credOf = async (id) =>
+  (await query(`select status, is_active, sealed, username_hint, pending_invoice_code from public.qpay_credentials where owner_id = $1`, [id])).rows[0];
+
+await check('оператор биш хүн QPay тохируулж ЧАДАХГҮЙ', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OWNER), body: creds() });
+  return r.status === 401 && (await credOf(ownerId)).status === 'pending';
+});
+
+await check('операторын SMS код 10 минутаас хуучин бол дахин баталгаажуулахыг шаардана', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR, { otpAgo: 3600 }), body: creds() });
+  return r.status === 401 && r.json?.code === 'REAUTH_REQUIRED';
+});
+
+await check('«энэ данс харилцагчийнх» гэж батлаагүй бол татгалзана', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR), body: creds({ confirmOwnership: false }) });
+  return r.status === 400 && r.json?.field === 'confirmOwnership';
+});
+
+await check('буруу QPay нууц үг → AUTH_FAILED, слот хөндөгдөхгүй', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR), body: creds({ password: 'wrong-pass' }) });
+  return r.json?.code === 'AUTH_FAILED' && (await credOf(ownerId)).status === 'pending';
+});
+
+await check('буруу нэхэмжлэхийн код → INVOICE_CODE_FAILED', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR), body: creds({ invoiceCode: 'BAD_CODE' }) });
+  return r.json?.code === 'INVOICE_CODE_FAILED' && (await credOf(ownerId)).status === 'pending';
+});
+
+await check('оператор QPay тохируулна: идэвхжинэ, шифрлэгдэнэ, туршилтын нэхэмжлэх цуцлагдана', async () => {
+  const before = qpayCalls.cancelled.length;
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR), body: creds() });
+  const c = await credOf(ownerId);
+  const audit = await query(
+    `select actor_user_id from public.credential_audit where owner_id = $1 and action = 'operator_configured'`, [ownerId]
+  );
+  const plaintext = await query(
+    `select count(*)::int n from public.qpay_credentials where sealed like '%Merchant-Pass-9%' or sealed like '%shinekofe%'`
+  );
+  return (
+    r.status === 200 && c.status === 'active' && c.is_active === true && c.sealed?.startsWith('v1.') &&
+    c.username_hint === 'sh••••••fe' && c.pending_invoice_code === null &&
+    audit.rows[0]?.actor_user_id === OPERATOR && plaintext.rows[0].n === 0 &&
+    qpayCalls.cancelled.length === before + 1 && !log.includes('Merchant-Pass-9')
+  ) || JSON.stringify({ r: r.json, c: { ...c, sealed: c?.sealed?.slice(0, 6) } });
+});
+
+await check('тохируулсны дараа машин эзэмшигчийн дансаар ажиллана', async () => {
+  const { resolveMachine, forgetAll } = await import('../src/owners.js');
+  forgetAll();
+  const m = await resolveMachine(DEVICE);
+  return m?.credential_status === 'active' && m.credential_active === true;
+});
+
+await check('нэг QPay дансыг өөр харилцагчид давхар тохируулахгүй', async () => {
+  const other = await call('/admin/v1/owners', {
+    token: op,
+    body: { ...newOwner, name: 'Өөр ХХК', contactPhone: '99887755', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
+  });
+  const r = await call(`/admin/v1/owners/${other.json.ownerId}/credentials`, { token: await mint(OPERATOR), body: creds() });
+  return (r.status === 409 && r.json?.code === 'DUPLICATE_OTHER_OWNER') || JSON.stringify(r.json);
+});
+
 bridge.kill();
 jwks.close();
+qpayFake.close();
 await close();
 
 const passed = results.filter(([ok]) => ok).length;

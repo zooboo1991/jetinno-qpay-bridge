@@ -689,6 +689,20 @@ export async function operatorSetInvoiceCode(actorUserId, ownerId, invoiceCode) 
   return rows[0]?.status ?? 'error';
 }
 
+/** Migration 010: the slot an operator is about to fill for an owner. */
+export async function operatorCredentialSlot(actorUserId, ownerId) {
+  const { rows } = await query(`select * from app.operator_credential_slot($1,$2)`, [actorUserId, ownerId]);
+  return rows[0] ?? { out_status: 'error' };
+}
+
+/** Writes the operator-proved, bridge-sealed credential and switches it on. */
+export async function operatorSetCredential(actorUserId, { ownerId, credentialId, sealed, keyId, fp, usernameHint, invoiceCodeHint }) {
+  const { rows } = await query(`select app.operator_set_credential($1,$2,$3,$4,$5,$6,$7,$8) as status`, [
+    actorUserId, ownerId, credentialId, sealed, keyId, fp, usernameHint, invoiceCodeHint,
+  ]);
+  return rows[0]?.status ?? 'error';
+}
+
 /** Stamped on every signed machine request; throttled to once a minute in SQL. */
 export async function touchMachineSeen(deviceNo) {
   await query(`select app.touch_machine_seen($1)`, [deviceNo]);

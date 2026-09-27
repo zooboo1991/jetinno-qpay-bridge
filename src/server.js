@@ -738,9 +738,13 @@ if (authHookConfigured() && DUAL_WRITE) {
  */
 if (authConfigured() && DUAL_WRITE && process.env.PORTAL_ORIGIN) {
   try {
-    const { default: credentialsRouter, mountVerifyCallback, sweepAbandonedVerifications } =
+    const { default: credentialsRouter, operatorRouter, mountVerifyCallback, sweepAbandonedVerifications } =
       await import('./credentials.js');
     app.use('/owner/v1', credentialsRouter);
+    // After adminApi: its operator gate passes a verified operator through,
+    // and this router — the one console route that sees a QPay password —
+    // checks again on its own.
+    app.use('/admin/v1', operatorRouter);
     mountVerifyCallback(app);
     // Verification invoices are 10₮ and live on the owner's own merchant. An
     // abandoned one is a trivial loss; an untracked one is not.

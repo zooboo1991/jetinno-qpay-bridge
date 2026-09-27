@@ -748,6 +748,109 @@ router.get('/credentials/:credentialId', async (req, res) => {
   });
 });
 
+// ===========================================================================
+// POST /admin/v1/owners/:ownerId/credentials
+//   { username, password, invoiceCode, confirmOwnership: true }
+//
+// The operator configures an owner's QPay from the console — the fallback
+// for an owner who cannot do it themselves. Same proofs against QPay as the
+// owner path (token, then a probe invoice that exercises the invoice code),
+// same sealing, same single place the plaintext lives.
+//
+// Differences, all deliberate:
+//   * no 4-digit read-back: the operator vouches, and must say so
+//     (confirmOwnership) — the probe invoice is cancelled at once;
+//   * the operator's OWN SMS code must be from the last ten minutes, whatever
+//     their session age: this re-points a business's revenue;
+//   * the owner is told by SMS at the number on the sales paperwork.
+//
+// Mounted on /admin/v1 AFTER the console's read router, whose operator gate
+// passes a verified operator through to here; this route checks again itself.
+// ===========================================================================
+const OPERATOR_STEP_UP_SECONDS = 600;
+const INVOICE_CODE = /^[A-Za-z0-9_-]{3,64}$/;
+
+export const operatorRouter = express.Router();
+
+operatorRouter.use((req, res, next) => {
+  if (!ALLOW_HTTP && !req.secure && req.get('x-forwarded-proto') !== 'https') return reply(res, 400, 'FORBIDDEN');
+  next();
+});
+operatorRouter.use(express.json({ limit: '2kb', type: 'application/json' }));
+
+operatorRouter.post('/owners/:ownerId/credentials', async (req, res) => {
+  const incident = crypto.randomBytes(4).toString('hex');
+  // Defeats the whole class of "an error handler serialised the request".
+  const body = req.body;
+  req.body = undefined;
+
+  let ownerId = null;
+  let credentialId = null;
+  let actorUserId = null;
+  try {
+    const actor = await authenticate(req);
+    if (!actor || !(await store.isOperator(actor.userId))) return reply(res, 401, 'FORBIDDEN');
+    actorUserId = actor.userId;
+
+    const now = Math.floor(Date.now() / 1000);
+    if (!actor.otpAt || now - actor.otpAt > OPERATOR_STEP_UP_SECONDS) return reply(res, 401, 'REAUTH_REQUIRED');
+
+    if (!UUID.test(req.params.ownerId)) return reply(res, 400, 'INVALID_INPUT', { field: 'ownerId' });
+    ownerId = req.params.ownerId;
+    if (body?.confirmOwnership !== true) return reply(res, 400, 'INVALID_INPUT', { field: 'confirmOwnership' });
+
+    const slot = await store.operatorCredentialSlot(actorUserId, ownerId);
+    if (slot.out_status !== 'ok') {
+      return reply(res, slot.out_status === 'verification_open' ? 409 : 404, String(slot.out_status).toUpperCase());
+    }
+    credentialId = slot.out_credential_id;
+
+    const fields = readCredentialFields({ ...(body ?? {}), credentialId });
+    if (fields.error) return reply(res, 400, 'INVALID_INPUT', { field: fields.error });
+    const invoiceCode = String(body?.invoiceCode ?? '').trim();
+    if (!INVOICE_CODE.test(invoiceCode)) return reply(res, 400, 'INVALID_INPUT', { field: 'invoiceCode' });
+
+    let v;
+    try {
+      v = await runVerification({
+        credentialId, ownerId,
+        username: fields.username, password: fields.password,
+        invoiceCode, nonce: newNonce(),
+      });
+    } catch (err) {
+      const kind = classify(err);
+      safeLog({ event: 'operator_verify_failed', ownerId, credentialId, actorUserId, outcome: kind, incident });
+      if (kind === 'qpay_unreachable') return reply(res, 502, 'QPAY_UNREACHABLE');
+      if (kind === 'auth_failed') return reply(res, 400, 'AUTH_FAILED');
+      if (err?.stage === 'invoice') return reply(res, 400, 'INVOICE_CODE_FAILED');
+      return reply(res, 500, 'SERVER_ERROR', { incident });
+    }
+
+    // The probe proved the invoice code; nobody needs to read it.
+    await cancelVerifyInvoice({ credentialId, ownerId, sealedBlob: v.sealed, invoiceId: v.invoiceId });
+
+    const status = await store.operatorSetCredential(actorUserId, {
+      ownerId, credentialId, sealed: v.sealed, keyId: v.keyId, fp: v.fp,
+      usernameHint: v.usernameHint, invoiceCodeHint: v.invoiceCodeHint,
+    });
+    if (status !== 'ok') {
+      if (status === 'duplicate_other_owner') alerts.pageOperator('duplicate merchant across owners', { ownerId, credentialId });
+      safeLog({ event: 'operator_configure_rejected', ownerId, credentialId, actorUserId, outcome: status });
+      return reply(res, 409, String(status).toUpperCase());
+    }
+
+    // Both caches forget the old merchant, as on the owner's confirm.
+    qpay.evictOwner(ownerId);
+    owners.forgetCredential(credentialId);
+    alerts.notifyOwnerCredentialChanged(ownerId).catch(() => {});
+    safeLog({ event: 'operator_configured', ownerId, credentialId, actorUserId, outcome: 'ok' });
+    return reply(res, 200, 'OK', { usernameHint: v.usernameHint, invoiceCodeHint: v.invoiceCodeHint, liveInSeconds: 60 });
+  } catch {
+    safeLog({ event: 'operator_configure_unhandled', ownerId, credentialId, actorUserId, outcome: 'error', incident });
+    return reply(res, 500, 'SERVER_ERROR', { incident });
+  }
+});
+
 /**
  * The verification invoice's callback. It exists so a verify invoice never
  * shares a URL with a sale: settling one must be impossible, not merely
