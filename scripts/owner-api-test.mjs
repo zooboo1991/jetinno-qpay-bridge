@@ -27,7 +27,7 @@ const results = [];
 const check = async (name, fn) => {
   try {
     const ok = await fn();
-    results.push([Boolean(ok), name, typeof ok === 'string' ? ` — ${ok}` : '']);
+    results.push([ok === true, name, typeof ok === 'string' ? ` — ${ok}` : '']);
   } catch (err) {
     results.push([false, name, ` — ${err.message.split('\n')[0]}`]);
   }
@@ -408,7 +408,7 @@ await check('оператор бол өөрөө эзэмшигч биш ч бү�
 
 await check('тулгах хуулга ownerId-гүйгээр бүх мөрийг өгөхгүй', async () => {
   const r = await call('/admin/v1/reconciliation', { token: await mint({ sub: userOperator }) });
-  return r.status === 200 && r.json.rows?.length === 0 && r.json.error;
+  return r.status === 200 && r.json.rows?.length === 0 && r.json.error === 'ownerId required';
 });
 
 await check('админы хариу кэшлэгдэхгүй', async () => {

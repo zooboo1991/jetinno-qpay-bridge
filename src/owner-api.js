@@ -46,7 +46,13 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
     next();
   });
 
-  router.use(requireOwner(log));
+  // Per route, NOT router.use(). This router and the credentials router share
+  // the /owner/v1 prefix, and a router-wide gate here answered 401 to every
+  // path under it — including /owner/v1/invites/redeem, which by definition
+  // is called by somebody who is not a member yet. The invite path was dead
+  // on arrival and no test noticed, because every test seeded owner_members
+  // directly. Unmatched paths must fall through.
+  const auth = requireOwner(log);
 
   /**
    * Everything the dashboard draws, in one call.
@@ -57,7 +63,7 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
    * which day a sale is filed under, and the answer for every machine we have
    * is Ulaanbaatar.
    */
-  router.get('/stats', async (req, res) => {
+  router.get('/stats', auth, async (req, res) => {
     const ownerId = resolveOwnerId(req, res);
     if (!ownerId) return;
     try {
@@ -70,7 +76,7 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   });
 
   /** Who am I, and which businesses can I switch between. */
-  router.get('/me', async (req, res) => {
+  router.get('/me', auth, async (req, res) => {
     try {
       const owners = await store.ownersByIds(req.owner.ownerIds);
       res.json({ userId: req.owner.userId, owners });

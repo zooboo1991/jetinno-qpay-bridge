@@ -142,8 +142,12 @@ function reply(res, httpStatus, code, extra = {}) {
 // Transport gate. Bearer-only, exact-origin CORS, no cookies anywhere — so the
 // bridge acquires no CSRF surface at all and needs no CSRF machinery.
 // ---------------------------------------------------------------------------
+// Local tests run the bridge on plain http. The escape hatch is refused in
+// production so a copied env group cannot open it on Render.
+const ALLOW_HTTP = process.env.CRED_ALLOW_HTTP === '1' && process.env.NODE_ENV !== 'production';
+
 router.use((req, res, next) => {
-  if (!req.secure && req.get('x-forwarded-proto') !== 'https') return reply(res, 400, 'FORBIDDEN');
+  if (!ALLOW_HTTP && !req.secure && req.get('x-forwarded-proto') !== 'https') return reply(res, 400, 'FORBIDDEN');
 
   const origin = req.get('origin');
   if (origin) {
@@ -180,11 +184,28 @@ async function authenticate(req) {
       audience: 'authenticated',
       clockTolerance: 30,
     });
-    return payload.sub ? { userId: payload.sub } : null;
+    return payload.sub ? { userId: payload.sub, otpAt: otpTimestamp(payload) } : null;
   } catch {
     safeLog({ event: 'jwt_invalid', outcome: 'rejected' });
     return null;
   }
+}
+
+/**
+ * When this session's OTP was actually typed, in epoch seconds, or null.
+ *
+ * Supabase records it in the token's `amr` claim and carries the ORIGINAL
+ * timestamp through every refresh, so a session that has merely been kept
+ * alive for a day does not look fresh — which is exactly the property a
+ * step-up check needs, and one `iat` does not have.
+ */
+function otpTimestamp(payload) {
+  const amr = Array.isArray(payload.amr) ? payload.amr : [];
+  const times = amr
+    .filter((e) => e && (e.method === 'otp' || e.method === 'sms'))
+    .map((e) => Number(e.timestamp))
+    .filter(Number.isFinite);
+  return times.length ? Math.max(...times) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +371,44 @@ router.post('/invites/redeem', async (req, res) => {
     alerts.pageOperator('invite presented by a non-matching phone', { status: r.out_status });
   }
   return reply(res, 409, 'INVITE_' + String(r.out_status).toUpperCase());
+});
+
+// ===========================================================================
+// GET  /owner/v1/step-up   — how fresh is this user's last OTP, and how fresh
+//                            does it need to be.
+// POST /owner/v1/step-up   — record an OTP the session JUST completed.
+//
+// The portal calls POST straight after every successful login, and GET before
+// it shows the credential form: an owner must never type a merchant password
+// blind on a phone keyboard only to be told afterwards that they needed an SMS
+// code first.
+// ===========================================================================
+const STEP_UP_RECORD_WINDOW_SECONDS = 300;
+
+router.get('/step-up', async (req, res) => {
+  const actor = await authenticate(req);
+  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  const age = await store.stepUpAgeSeconds(actor.userId);
+  return reply(res, 200, 'OK', {
+    ageSeconds: age,
+    firstEntryMaxSeconds: STEP_UP_FIRST_SECONDS,
+    changeMaxSeconds: STEP_UP_CHANGE_SECONDS,
+  });
+});
+
+router.post('/step-up', async (req, res) => {
+  req.body = undefined;
+  const actor = await authenticate(req);
+  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  // The proof is the token's own OTP timestamp, not the portal's say-so: a
+  // portal that could stamp step-up at will would make the check decorative.
+  const now = Math.floor(Date.now() / 1000);
+  if (!actor.otpAt || now - actor.otpAt > STEP_UP_RECORD_WINDOW_SECONDS) {
+    return reply(res, 401, 'REAUTH_REQUIRED');
+  }
+  await store.touchStepUp(actor.userId, 'step_up');
+  safeLog({ event: 'step_up', actorUserId: actor.userId, outcome: 'ok' });
+  return reply(res, 200, 'OK');
 });
 
 // ===========================================================================

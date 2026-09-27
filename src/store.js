@@ -267,8 +267,21 @@ export async function ownersByIds(ownerIds) {
     // on auth.uid(), and the bridge connects as service_role with no
     // auth.uid() to read; the owner filter here is the access check instead,
     // and the caller has already proved membership of these ids.
+    //
+    // `machines` is the recognition signal: an owner is taught to stop if the
+    // page does not show THEIR machine number, so it must come from here and
+    // never from a default. `credential_id` is what the credential form posts
+    // back to /owner/v1/credentials/verify.
     `select o.id, o.name, o.status,
-            count(distinct m.id) filter (where m.status = 'active')::int as active_machines,
+            (select count(*)::int from public.machines m
+              where m.owner_id = o.id and m.status = 'active') as active_machines,
+            coalesce((select json_agg(json_build_object(
+                               'device_no', m.device_no, 'label', m.label,
+                               'location', m.location, 'status', m.status)
+                             order by m.created_at)
+                        from public.machines m
+                       where m.owner_id = o.id and m.status <> 'retired'), '[]'::json) as machines,
+            c.id                as credential_id,
             c.status            as credential_status,
             c.is_active         as credential_active,
             c.username_hint     as credential_username_hint,
@@ -276,9 +289,8 @@ export async function ownersByIds(ownerIds) {
             (c.verify_expires_at is not null and c.verify_expires_at > now())
                                 as credential_verification_open
        from public.owners o
-       left join public.machines m on m.owner_id = o.id
        left join lateral (
-         select qc.status, qc.is_active, qc.username_hint,
+         select qc.id, qc.status, qc.is_active, qc.username_hint,
                 qc.last_verified_at, qc.verify_expires_at
            from public.qpay_credentials qc
           where qc.owner_id = o.id
@@ -286,8 +298,6 @@ export async function ownersByIds(ownerIds) {
           limit 1
        ) c on true
       where o.id = any($1::uuid[])
-      group by o.id, c.status, c.is_active, c.username_hint,
-               c.last_verified_at, c.verify_expires_at
       order by o.name`,
     [ownerIds]
   );
@@ -643,6 +653,40 @@ export async function operatorReconciliation(actorUserId, { ownerId, from, to, t
 export async function isOperator(userId) {
   const { rows } = await query(`select app.is_operator_user($1) as ok`, [userId]);
   return rows[0]?.ok === true;
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding (migration 008). Writes, unlike everything above — and still no
+// check here: each SQL function verifies operator membership itself.
+// ---------------------------------------------------------------------------
+
+/** Owner + first machine + empty credential slot, in one transaction. */
+export async function operatorProvisionOwner(actorUserId, {
+  credentialId, name, contactPhone, deviceNo, location, invoiceCode,
+}) {
+  const { rows } = await query(
+    `select * from app.operator_provision_owner($1,$2,$3,$4,$5,$6,$7)`,
+    [actorUserId, credentialId, name, contactPhone, deviceNo, location ?? null, invoiceCode]
+  );
+  return rows[0] ?? { out_status: 'error' };
+}
+
+/** Takes the token's DIGEST. The raw token never reaches Postgres. */
+export async function operatorCreateInvite(actorUserId, { ownerId, tokenHash, reference, invitedPhone, role }) {
+  const { rows } = await query(
+    `select * from app.operator_create_invite($1,$2,$3,$4,$5,$6)`,
+    [actorUserId, ownerId, tokenHash, reference, invitedPhone, role]
+  );
+  return rows[0] ?? { out_status: 'error' };
+}
+
+export async function operatorSetInvoiceCode(actorUserId, ownerId, invoiceCode) {
+  const { rows } = await query(`select app.operator_set_invoice_code($1,$2,$3) as status`, [
+    actorUserId,
+    ownerId,
+    invoiceCode,
+  ]);
+  return rows[0]?.status ?? 'error';
 }
 
 /** Stamped on every signed machine request; throttled to once a minute in SQL. */

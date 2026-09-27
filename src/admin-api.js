@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'node:crypto';
 import * as store from './store.js';
 import { verifyAccessToken } from './owner-auth.js';
 
@@ -18,10 +19,12 @@ import { verifyAccessToken } from './owner-auth.js';
  * the database would still refuse, and if the SQL check were ever relaxed the
  * router would still refuse.
  *
- * Read-only. Nothing here writes, so there is no operator action that can be
- * triggered by a forged request — the worst outcome of a bypass is disclosure,
- * which is bad enough to be worth the double check and not bad enough to
- * justify a second authentication scheme.
+ * Almost read-only. The writes are onboarding and nothing else — register a
+ * business with an empty credential slot, issue its invite, correct its
+ * invoice code — and none of them can touch a sealed credential or make
+ * anybody a member. The owner still has to present the invite from the right
+ * phone and type their own QPay password; the operator can hand over the key
+ * but cannot turn it.
  */
 
 const TZ = 'Asia/Ulaanbaatar';
@@ -49,6 +52,14 @@ function requireOperator(log = () => {}) {
   };
 }
 
+// No 0/O or 1/I: the reference is read aloud over the phone.
+const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function inviteReference() {
+  const pick = () => REF_ALPHABET[crypto.randomInt(REF_ALPHABET.length)];
+  const part = () => Array.from({ length: 4 }, pick).join('');
+  return `${part()}-${part()}`;
+}
+
 export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
   const router = express.Router();
 
@@ -58,7 +69,7 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
       res.setHeader('Access-Control-Allow-Origin', portalOrigin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     }
     if (req.method === 'OPTIONS') return res.status(204).end();
     // Every response here is one operator's view of live money. A shared
@@ -154,6 +165,75 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
         timezone: TZ,
       }),
     };
+  }));
+
+  // -------------------------------------------------------------------------
+  // Onboarding writes (migration 008).
+  // -------------------------------------------------------------------------
+  const json = express.json({ limit: '4kb', type: 'application/json' });
+  const str = (v) => (typeof v === 'string' ? v : '');
+
+  /** A business, its first machine and an empty credential slot. */
+  router.post('/owners', json, handler('provision', async (req) => {
+    const b = req.body ?? {};
+    const r = await store.operatorProvisionOwner(req.operator.userId, {
+      // Generated here, not in SQL: the credential id is bound into the AEAD
+      // additional data the owner's password will be sealed under.
+      credentialId: crypto.randomUUID(),
+      name: str(b.name),
+      contactPhone: str(b.contactPhone),
+      deviceNo: str(b.deviceNo),
+      location: str(b.location),
+      invoiceCode: str(b.invoiceCode),
+    });
+    log('admin provision', r.out_status, r.out_owner_id ?? '');
+    return { status: r.out_status, ownerId: r.out_owner_id ?? null };
+  }));
+
+  /**
+   * The invite link's secret half.
+   *
+   * 32 random bytes, returned exactly once, to the operator's own session —
+   * Postgres keeps only the sha256, so nothing stored can mint a working
+   * link. The reference is the non-secret handle for talking about an invite
+   * on the phone.
+   */
+  router.post('/owners/:ownerId/invite', json, handler('invite', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId) return { status: 'not_found' };
+    const b = req.body ?? {};
+    const role = b.role === 'admin' || b.role === 'viewer' ? b.role : null;
+    if (!role) return { status: 'invalid_role' };
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const token = crypto.randomBytes(32).toString('base64url');
+      const tokenHash = crypto.createHash('sha256').update(token, 'utf8').digest();
+      try {
+        const r = await store.operatorCreateInvite(req.operator.userId, {
+          ownerId,
+          tokenHash,
+          reference: inviteReference(),
+          invitedPhone: str(b.invitedPhone),
+          role,
+        });
+        log('admin invite', r.out_status, r.out_reference ?? '');
+        if (r.out_status !== 'ok') return { status: r.out_status };
+        return { status: 'ok', token, reference: r.out_reference, expiresAt: r.out_expires_at, role };
+      } catch (err) {
+        // A reference collision (one in a trillion) gets a fresh draw; any
+        // other error is a real failure.
+        if (err.code !== '23505') throw err;
+      }
+    }
+    throw new Error('invite reference collided three times');
+  }));
+
+  router.post('/owners/:ownerId/invoice-code', json, handler('invoice-code', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId) return { status: 'not_found' };
+    const status = await store.operatorSetInvoiceCode(req.operator.userId, ownerId, str(req.body?.invoiceCode));
+    log('admin invoice code', status, ownerId);
+    return { status };
   }));
 
   /** Am I an operator? The portal asks this to decide whether to show the link. */

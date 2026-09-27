@@ -18,7 +18,8 @@
     "test:tenant": "bash scripts/tenant-test.sh",
     "test:cache": "bash scripts/cache-test.sh",
     "preflight": "node --env-file=.env scripts/preflight.mjs",
-    "test:operator": "bash scripts/operator-test.sh"
+    "test:operator": "bash scripts/operator-test.sh",
+    "test:onboarding": "bash scripts/onboarding-test.sh"
   },
   "engines": {
     "node": ">=20"

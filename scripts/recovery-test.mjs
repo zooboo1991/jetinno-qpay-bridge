@@ -18,7 +18,7 @@ const results = [];
 const check = async (name, fn) => {
   try {
     const ok = await fn();
-    results.push([Boolean(ok), name, typeof ok === 'string' ? ` — ${ok}` : '']);
+    results.push([ok === true, name, typeof ok === 'string' ? ` — ${ok}` : '']);
   } catch (err) {
     results.push([false, name, ` — ${err.message.split('\n')[0]}`]);
   }
