@@ -689,6 +689,21 @@ export async function operatorSetInvoiceCode(actorUserId, ownerId, invoiceCode) 
   return rows[0]?.status ?? 'error';
 }
 
+/** Migration 011: invite texts sent to this number in the last day. */
+export async function inviteSmsCount24h(phone) {
+  const { rows } = await query(
+    `select count(*)::int n from public.sms_sends
+      where phone = app.norm_phone($1) and purpose = 'invite' and ok and at > now() - interval '24 hours'`,
+    [phone]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+/** One row per message, success or failure — the gateway's reply already scrubbed. */
+export async function recordSmsSend(phone, purpose, ok, status, error, reply) {
+  await query(`select app.record_sms_send($1, $2, $3, $4, $5, $6)`, [phone, purpose, ok, status, error, reply]);
+}
+
 /** Migration 010: the slot an operator is about to fill for an owner. */
 export async function operatorCredentialSlot(actorUserId, ownerId) {
   const { rows } = await query(`select * from app.operator_credential_slot($1,$2)`, [actorUserId, ownerId]);

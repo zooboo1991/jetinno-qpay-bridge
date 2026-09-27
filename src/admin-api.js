@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import * as store from './store.js';
 import { verifyAccessToken } from './owner-auth.js';
+import { sendSms, smsConfigured, localNumber } from './sms.js';
 
 /**
  * The operator console's read API.
@@ -191,39 +192,60 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
   }));
 
   /**
-   * The invite link's secret half.
+   * Texts the invite link to the number on the registration.
    *
-   * 32 random bytes, returned exactly once, to the operator's own session —
-   * Postgres keeps only the sha256, so nothing stored can mint a working
-   * link. The reference is the non-secret handle for talking about an invite
-   * on the phone.
+   * The token is minted here, hashed into Postgres, and sent straight to the
+   * owner's phone — it is never returned, so it never sits on the operator's
+   * screen, in their browser history, or in a console log. The owner opens
+   * it, proves the SAME number by SMS code, and chooses a password.
+   *
+   * Role is admin, always: the person on the registration is the person who
+   * connects the business's QPay. Re-sending revokes the previous link.
    */
   router.post('/owners/:ownerId/invite', json, handler('invite', async (req) => {
     const ownerId = uuidOrNull(req.params.ownerId);
     if (!ownerId) return { status: 'not_found' };
-    const b = req.body ?? {};
-    const role = b.role === 'admin' || b.role === 'viewer' ? b.role : null;
-    if (!role) return { status: 'invalid_role' };
+    if (!portalOrigin) return { status: 'no_portal_origin' };
+    if (!smsConfigured()) return { status: 'sms_not_configured' };
+    const phone = await store.ownerContactPhone(ownerId);
+    if (!phone) return { status: 'not_found' };
+    // A ceiling on a button that spends money and texts a customer.
+    if ((await store.inviteSmsCount24h(phone)) >= 5) return { status: 'too_many' };
 
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = crypto.randomBytes(32).toString('base64url');
       const tokenHash = crypto.createHash('sha256').update(token, 'utf8').digest();
+      let r;
       try {
-        const r = await store.operatorCreateInvite(req.operator.userId, {
+        r = await store.operatorCreateInvite(req.operator.userId, {
           ownerId,
           tokenHash,
           reference: inviteReference(),
-          invitedPhone: str(b.invitedPhone),
-          role,
+          invitedPhone: phone,
+          role: 'admin',
         });
-        log('admin invite', r.out_status, r.out_reference ?? '');
-        if (r.out_status !== 'ok') return { status: r.out_status };
-        return { status: 'ok', token, reference: r.out_reference, expiresAt: r.out_expires_at, role };
       } catch (err) {
-        // A reference collision (one in a trillion) gets a fresh draw; any
-        // other error is a real failure.
-        if (err.code !== '23505') throw err;
+        // A reference collision (one in a trillion) gets a fresh draw.
+        if (err.code === '23505') continue;
+        throw err;
       }
+      if (r.out_status !== 'ok') return { status: r.out_status };
+
+      const link = `${portalOrigin}/invite/${token}`;
+      const sms = await sendSms(phone, `Coffeine: Кофе машины эзэмшигчийн хэсэгт бүртгүүлэх холбоос: ${link}`);
+      // The gateway may echo the message; the token must not reach the table.
+      const scrub = (t) => (t == null ? null : String(t).split(token).join('***'));
+      await store.recordSmsSend(phone, 'invite', sms.ok, sms.status ?? null, sms.ok ? null : scrub(sms.error), scrub(sms.reply ?? sms.error));
+      log('admin invite', sms.ok ? 'sent' : 'sms failed', r.out_reference);
+      return {
+        status: sms.ok ? 'ok' : 'sms_failed',
+        reference: r.out_reference,
+        expiresAt: r.out_expires_at,
+        // The whole number, on purpose: this is where the operator sees a
+        // mistyped digit before the owner waits for a message that went to a
+        // stranger.
+        sentTo: localNumber(phone),
+      };
     }
     throw new Error('invite reference collided three times');
   }));

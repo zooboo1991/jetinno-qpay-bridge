@@ -97,6 +97,21 @@ const qpayFake = createServer((req, res) => {
 });
 await new Promise((r) => qpayFake.listen(QPAY_PORT, '127.0.0.1', r));
 
+// ---- a stand-in SMS gateway, Skytel-shaped ------------------------------------
+const SMS_PORT = 4596;
+const smsOut = [];
+const smsFake = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (d) => (raw += d));
+  req.on('end', () => {
+    const p = new URLSearchParams(raw);
+    smsOut.push({ to: p.get('sendto'), text: p.get('message') });
+    res.setHeader('content-type', 'application/json');
+    res.end('{"status":1,"sent_count":1,"message":"ok"}');
+  });
+});
+await new Promise((r) => smsFake.listen(SMS_PORT, '127.0.0.1', r));
+
 // ---- boot the bridge -------------------------------------------------------
 const PORT = 3197;
 const key = () => randomBytes(32).toString('base64');
@@ -115,6 +130,8 @@ const bridge = spawn(process.execPath, ['src/server.js'], {
     CRED_FP_KEY: key(),
     CRED_ALLOW_HTTP: '1',
     QPAY_BASE_URL: `http://127.0.0.1:${QPAY_PORT}`,
+    SMS_API_URL: `http://127.0.0.1:${SMS_PORT}/send`,
+    SMS_API_KEY: 'test-sms-key',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -202,52 +219,49 @@ await check('аудитад owner_provisioned бичигдэнэ', async () => {
   return rows[0].n === 1;
 });
 
-// ---- invites ---------------------------------------------------------------
-await check('урилгын утас гэрээн дээрхээс өөр бол татгалзана', async () => {
-  const r = await call(`/admin/v1/owners/${ownerId}/invite`, {
-    token: op, body: { invitedPhone: '99887767', role: 'admin' },
-  });
-  return r.json?.status === 'phone_mismatch';
-});
-
-await check('эрхийг (admin/viewer) заавал сонгуулна — анхдагч утга байхгүй', async () => {
-  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: { invitedPhone: OWNER_PHONE } });
-  return r.json?.status === 'invalid_role';
-});
-
+// ---- invites: texted to the registered number --------------------------------
+// The token is read out of the message the fake gateway received — exactly
+// where the owner will read it — and never out of an API response.
+const tokenIn = (msg) => /\/invite\/([A-Za-z0-9_-]+)/.exec(msg ?? '')?.[1] ?? null;
 let first;
 let second;
-await check('урилга: токен НЭГ удаа буцна, санд зөвхөн hash нь хадгалагдана', async () => {
-  const r = await call(`/admin/v1/owners/${ownerId}/invite`, {
-    token: op, body: { invitedPhone: OWNER_PHONE, role: 'admin' },
-  });
-  first = r.json;
-  const hash = createHash('sha256').update(first.token, 'utf8').digest();
+await check('урилга бүртгэлтэй дугаар руу SMS-ээр очно, хариунд токен БАЙХГҮЙ', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: {} });
+  const msg = smsOut.at(-1);
+  first = { token: tokenIn(msg?.text), reference: r.json?.reference };
+  const hash = createHash('sha256').update(first.token ?? '', 'utf8').digest();
   const { rows } = await query(
-    `select count(*)::int n from public.owner_invites where token_hash = $1 and reference = $2`,
+    `select count(*)::int n from public.owner_invites where token_hash = $1 and reference = $2 and invited_phone = '97699887766'`,
     [hash, first.reference]
   );
-  const leaked = await query(
-    `select count(*)::int n from public.owner_invites where encode(token_hash,'escape') like '%' || $1 || '%'`,
-    [first.token.slice(0, 12)]
-  );
   return (
-    first.status === 'ok' && first.token.length >= 40 &&
-    /^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(first.reference) &&
-    rows[0].n === 1 && leaked.rows[0].n === 0 && !log.includes(first.token)
-  ) || JSON.stringify(first);
+    r.json?.status === 'ok' && r.json.sentTo === '99887766' && !JSON.stringify(r.json).includes(first.token) &&
+    msg?.to === '99887766' && msg.text.includes('https://kofe.mn/invite/') &&
+    first.token?.length >= 40 && rows[0].n === 1 && !log.includes(first.token)
+  ) || JSON.stringify({ r: r.json, to: msg?.to });
 });
 
-await check('шинэ урилга гаргахад өмнөх нь хүчингүй болно', async () => {
-  const r = await call(`/admin/v1/owners/${ownerId}/invite`, {
-    token: op, body: { invitedPhone: OWNER_PHONE, role: 'admin' },
-  });
-  second = r.json;
+await check('урилгын SMS бүртгэгдэнэ, токен бүртгэлд үлдэхгүй', async () => {
+  const { rows } = await query(
+    `select ok, gateway_reply from public.sms_sends where purpose = 'invite' and phone = '97699887766' order by at desc limit 1`
+  );
+  return rows[0]?.ok === true && !String(rows[0].gateway_reply).includes(first.token);
+});
+
+await check('урилга дахин илгээхэд өмнөх холбоос хүчингүй болно', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: {} });
+  second = { token: tokenIn(smsOut.at(-1)?.text), reference: r.json?.reference };
   const { rows } = await query(
     `select reference, revoked_reason from public.owner_invites where owner_id = $1 order by created_at`,
     [ownerId]
   );
-  return second.status === 'ok' && rows.length === 2 && rows[0].revoked_reason === 'superseded' && rows[1].revoked_reason === null;
+  return r.json?.status === 'ok' && second.token !== first.token && rows.length === 2 &&
+    rows[0].revoked_reason === 'superseded' && rows[1].revoked_reason === null;
+});
+
+await check('урилгын SMS нэвтрэх кодын лимитэд тооцогдохгүй', async () => {
+  const { rows } = await query(`select * from app.sms_budget('99887766')`);
+  return rows[0].out_allowed === true;
 });
 
 // ---- redemption: the path that was dead ------------------------------------
@@ -440,6 +454,7 @@ await check('нэг QPay дансыг өөр харилцагчид давхар
 bridge.kill();
 jwks.close();
 qpayFake.close();
+smsFake.close();
 await close();
 
 const passed = results.filter(([ok]) => ok).length;
