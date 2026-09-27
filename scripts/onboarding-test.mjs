@@ -310,6 +310,36 @@ await check('шинэ машин бүртгэлтэй, QPay слот нь pendin
   return (r && r.credential_status === 'pending' && r.credential_active === false) || JSON.stringify(r);
 });
 
+// ---- the bootstrap: an operator named by phone ------------------------------------
+// Nobody could reach the console before 009: the login SMS only goes to owner
+// members and invitees, and the operator is neither.
+const PHONE_OP = randomUUID();
+await check('утсаар бүртгэсэн оператор SMS код авах эрхтэй, танихгүй дугаар авахгүй', async () => {
+  await query(`insert into public.operator_phones (phone, label) values ('97699110088','Шинэ оператор')`);
+  const { rows } = await query(
+    `select app.phone_may_receive_otp('9911 0088') as op, app.phone_may_receive_otp('99110089') as stranger`
+  );
+  return rows[0].op === true && rows[0].stranger === false;
+});
+
+await check('утас БАТАЛГААЖААГҮЙ бол оператор биш — код хүссэн төдийгөөр эрх олгохгүй', async () => {
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699110088',null)`, [PHONE_OP]);
+  const r = await call('/admin/v1/me', { token: await mint(PHONE_OP) });
+  return r.status === 401;
+});
+
+await check('OTP-оор баталгаажсаны дараа консолд орно', async () => {
+  await query(`update auth.users set phone_confirmed_at = now() where id = $1`, [PHONE_OP]);
+  const r = await call('/admin/v1/me', { token: await mint(PHONE_OP) });
+  return r.status === 200 && r.json?.isOperator === true;
+});
+
+await check('утсыг жагсаалтаас хасахад эрх тэр даруй алга болно', async () => {
+  await query(`delete from public.operator_phones where phone = '97699110088'`);
+  const r = await call('/admin/v1/me', { token: await mint(PHONE_OP) });
+  return r.status === 401;
+});
+
 bridge.kill();
 jwks.close();
 await close();
