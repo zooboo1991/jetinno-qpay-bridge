@@ -457,6 +457,88 @@ await check('машины зам эзэмшигчийн API-аас хамаар�
   return r.status === 200 && j.ok === true;
 });
 
+// ---- the owner's console (migration 014) ------------------------------------------
+const devOf = async (who) => (await query(`select device_no from public.machines where id = $1`, [who.machineId])).rows[0].device_no;
+const alphaDev = await devOf(alpha);
+const betaDev = await devOf(beta);
+// One order that needs a human, one QR nobody paid — on Альфа only.
+await query(
+  `insert into public.orders (machine_id, owner_id, qpay_credential_id, order_no, device_no, notify_url,
+     product_id, product_name, raw_order_amount, amount_divisor, amount_mnt, qpay_sender_invoice_no,
+     qpay_invoice_id, callback_url, status, payment_confirmed_at, last_error)
+   values ($1,$2,$3,'STUCK-1',$4,'http://x/n','2','Американо','350000',100,3500,'STUCK-1','inv_stuck','http://x/cb',
+           'needs_human', now(), 'machine unreachable'),
+          ($1,$2,$3,'WALKED-1',$4,'http://x/n','1','Латте','450000',100,4500,'WALKED-1','inv_walk','http://x/cb',
+           'cancelled', null, null)`,
+  [alpha.machineId, alpha.ownerId, alpha.credId, alphaDev]
+);
+
+const tA = await mint({ sub: userAlpha });
+
+await check('консол: хугацааны нийлбэр, аяга, QR-ийн хөрвөлт зөв', async () => {
+  const r = await call('/owner/v1/summary', { token: tA });
+  const s = r.json?.summary;
+  // paid 4000 + 3000; QR shown = 2 paid + 1 needs_human + 1 cancelled
+  return (
+    r.status === 200 && s.amount === 7000 && s.cups === 2 && s.qrShown === 4 &&
+    s.paid === 2 && s.unpaid === 1 && s.failed === 1 && s.conversionPct === 50 &&
+    Array.isArray(s.days) && s.days.length >= 30
+  ) || JSON.stringify(s && { ...s, days: s.days?.length });
+});
+
+await check('консол: захиалгын жагсаалт ба төлөвөөр шүүх', async () => {
+  const all = await call('/owner/v1/orders', { token: tA });
+  const paid = await call('/owner/v1/orders?status=paid', { token: tA });
+  const unpaid = await call('/owner/v1/orders?status=unpaid', { token: tA });
+  return (
+    all.json?.total === 4 && paid.json?.orders?.length === 2 &&
+    unpaid.json?.orders?.[0]?.order_no === 'WALKED-1' && typeof all.json.orders[0].local_time === 'string'
+  ) || JSON.stringify({ all: all.json?.total, paid: paid.json?.orders?.length });
+});
+
+await check('консол: БУСДЫН машины дугаараар шүүвэл юу ч харагдахгүй', async () => {
+  const r = await call(`/owner/v1/orders?machine=${betaDev}`, { token: tA });
+  const s = await call(`/owner/v1/summary?machine=${betaDev}`, { token: tA });
+  const own = await call(`/owner/v1/orders?machine=${alphaDev}`, { token: tA });
+  return r.json?.total === 0 && s.json?.summary?.amount === 0 && own.json?.total === 4;
+});
+
+await check('консол: өөр компанийн ownerId-г асуувал 404', async () => {
+  const r = await call(`/owner/v1/orders?ownerId=${beta.ownerId}`, { token: tA });
+  return r.status === 404;
+});
+
+await check('консол: хоёр компанитай хэрэглэгч ownerId-гоор сольж харна', async () => {
+  const r = await call(`/owner/v1/summary?ownerId=${beta.ownerId}`, { token: await mint({ sub: userBoth }) });
+  return r.status === 200 && r.json?.summary?.amount === 777000;
+});
+
+await check('консол: машин бүрийн хүснэгт', async () => {
+  const r = await call('/owner/v1/machines', { token: tA });
+  const m = r.json?.machines;
+  return (m?.length === 1 && m[0].device_no === alphaDev && Number(m[0].amount) === 7000 && m[0].qr_shown === 4) ||
+    JSON.stringify(m);
+});
+
+await check('консол: асуудлын жагсаалт зөвхөн өөрийнх', async () => {
+  const a = await call('/owner/v1/problems', { token: tA });
+  const b = await call(`/owner/v1/problems?ownerId=${beta.ownerId}`, { token: await mint({ sub: userBoth }) });
+  return (
+    a.json?.problems?.some((p) => p.kind === 'needs_human' && p.reference === 'STUCK-1') &&
+    !b.json?.problems?.some((p) => p.reference === 'STUCK-1')
+  ) === true || JSON.stringify(a.json);
+});
+
+await check('консол: хугацааны буруу параметр унагаахгүй — сүүлийн 30 хоног', async () => {
+  const r = await call('/owner/v1/summary?from=bogus&to=2026-13-45', { token: tA });
+  return r.status === 200 && r.json?.summary?.amount === 7000;
+});
+
+await check('консол: хугацааны шүүлт — ирээдүйн хугацаанд юу ч алга', async () => {
+  const r = await call('/owner/v1/summary?from=2030-01-01&to=2030-01-31', { token: tA });
+  return r.status === 200 && r.json?.summary?.amount === 0 && r.json?.summary?.days?.length === 31;
+});
+
 bridge.kill('SIGTERM');
 jwksServer.close();
 await close();

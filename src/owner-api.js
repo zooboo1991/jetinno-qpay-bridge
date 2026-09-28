@@ -75,6 +75,82 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // The owner's console (migration 014). Periods arrive as local dates,
+  // YYYY-MM-DD, `to` inclusive; they become [from 00:00, to+1 00:00) in
+  // Ulaanbaatar time. Anything malformed falls back to the last 30 days
+  // rather than failing — a bad bookmark should still show a report.
+  // -------------------------------------------------------------------------
+  const DAY = /^\d{4}-\d{2}-\d{2}$/;
+  const UB_OFFSET = '+08:00';
+  function period(q) {
+    const todayUb = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+    let to = DAY.test(String(q.to ?? '')) ? String(q.to) : todayUb;
+    let from = DAY.test(String(q.from ?? '')) ? String(q.from) : null;
+    const toEnd = new Date(`${to}T00:00:00${UB_OFFSET}`);
+    if (Number.isNaN(toEnd.getTime())) to = todayUb;
+    const end = new Date(new Date(`${to}T00:00:00${UB_OFFSET}`).getTime() + 86400e3);
+    let start = from ? new Date(`${from}T00:00:00${UB_OFFSET}`) : new Date(end.getTime() - 30 * 86400e3);
+    if (Number.isNaN(start.getTime()) || start >= end) start = new Date(end.getTime() - 30 * 86400e3);
+    // A year and a bit at most: the day series is one row per day.
+    if (end - start > 400 * 86400e3) start = new Date(end.getTime() - 400 * 86400e3);
+    return { from: start.toISOString(), to: end.toISOString() };
+  }
+  const device = (q) => {
+    const d = String(q.machine ?? '');
+    return /^[A-Za-z0-9_-]{1,40}$/.test(d) ? d : null;
+  };
+  const BUCKETS = new Set(['paid', 'unpaid', 'failed', 'pending', 'no_cup']);
+
+  /** Wraps a read so a query failure never leaks a pg message. */
+  const read = (name, fn) => [auth, async (req, res) => {
+    const ownerId = resolveOwnerId(req, res);
+    if (!ownerId) return;
+    try {
+      res.json(await fn(ownerId, req.query));
+    } catch (err) {
+      log(`owner ${name} failed`, ownerId, err.message.split('\n')[0]);
+      res.status(500).json({ error: 'SYSTEM_ERROR' });
+    }
+  }];
+
+  router.get('/summary', ...read('summary', async (ownerId, q) => {
+    const p = period(q);
+    return { ...p, machine: device(q), summary: await store.ownerSummary(ownerId, { ...p, deviceNo: device(q) }) };
+  }));
+
+  router.get('/orders', ...read('orders', async (ownerId, q) => {
+    const p = period(q);
+    const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 500);
+    const offset = Math.max(Number(q.offset) || 0, 0);
+    const bucket = BUCKETS.has(String(q.status)) ? String(q.status) : null;
+    const rows = await store.ownerOrders(ownerId, { ...p, deviceNo: device(q), bucket, limit, offset });
+    return {
+      ...p,
+      total: Number(rows[0]?.total_count ?? 0),
+      orders: rows.map(({ total_count, ...r }) => r),
+    };
+  }));
+
+  router.get('/machines', ...read('machines', async (ownerId, q) => {
+    const p = period(q);
+    return { ...p, machines: await store.ownerMachines(ownerId, p) };
+  }));
+
+  router.get('/hourly', ...read('hourly', async (ownerId, q) => {
+    const p = period(q);
+    return { ...p, hours: await store.ownerHourly(ownerId, { ...p, deviceNo: device(q) }) };
+  }));
+
+  router.get('/products', ...read('products', async (ownerId, q) => {
+    const p = period(q);
+    return { ...p, products: await store.ownerProducts(ownerId, { ...p, deviceNo: device(q) }) };
+  }));
+
+  router.get('/problems', ...read('problems', async (ownerId) => ({
+    problems: await store.ownerProblems(ownerId),
+  })));
+
   /** Who am I, and which businesses can I switch between. */
   router.get('/me', auth, async (req, res) => {
     try {

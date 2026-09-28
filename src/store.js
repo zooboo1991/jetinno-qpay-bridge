@@ -698,6 +698,43 @@ export async function operatorSetInvoiceCode(actorUserId, ownerId, invoiceCode) 
   return rows[0]?.status ?? 'error';
 }
 
+// ---------------------------------------------------------------------------
+// The owner's console (migration 014). The caller has already proved
+// membership of ownerId; a device filter is matched against that owner's own
+// machines inside SQL.
+// ---------------------------------------------------------------------------
+export async function ownerSummary(ownerId, { from, to, deviceNo }) {
+  const { rows } = await query(`select app.owner_summary($1,$2,$3,$4) as s`, [ownerId, from, to, deviceNo ?? null]);
+  return rows[0]?.s ?? null;
+}
+
+export async function ownerOrders(ownerId, { from, to, deviceNo, bucket, limit, offset }) {
+  const { rows } = await query(`select * from app.owner_orders($1,$2,$3,$4,$5,$6,$7)`, [
+    ownerId, from, to, deviceNo ?? null, bucket ?? null, limit ?? 50, offset ?? 0,
+  ]);
+  return rows;
+}
+
+export async function ownerMachines(ownerId, { from, to }) {
+  const { rows } = await query(`select * from app.owner_machines($1,$2,$3)`, [ownerId, from, to]);
+  return rows;
+}
+
+export async function ownerHourly(ownerId, { from, to, deviceNo }) {
+  const { rows } = await query(`select * from app.owner_hourly($1,$2,$3,$4)`, [ownerId, from, to, deviceNo ?? null]);
+  return rows;
+}
+
+export async function ownerProducts(ownerId, { from, to, deviceNo }) {
+  const { rows } = await query(`select * from app.owner_products($1,$2,$3,$4)`, [ownerId, from, to, deviceNo ?? null]);
+  return rows;
+}
+
+export async function ownerProblems(ownerId) {
+  const { rows } = await query(`select * from app.owner_problems($1)`, [ownerId]);
+  return rows;
+}
+
 /** Migration 011: invite texts sent to this number in the last day. */
 export async function inviteSmsCount24h(phone) {
   const { rows } = await query(
