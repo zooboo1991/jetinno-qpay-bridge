@@ -84,6 +84,10 @@ const qpayFake = createServer((req, res) => {
     if (req.url === '/v2/invoice' && req.method === 'POST') {
       const body = JSON.parse(raw || '{}');
       qpayCalls.invoice.push(body);
+      if (!/^https?:\/\/[^/]+\//.test(String(body.callback_url))) {
+        res.statusCode = 400;
+        return res.end('{"error":{"callback_url":{"type":"INVALID","message":"Invalid!"}}}');
+      }
       if (body.invoice_code === 'BAD_CODE') { res.statusCode = 400; return res.end('{"error":"INVOICE_CODE_INVALID"}'); }
       // A refusal that is NOT about the invoice code. The body echoes a
       // username, as QPay's can — it must not reach the database or the log.
@@ -128,7 +132,10 @@ const bridge = spawn(process.execPath, ['src/server.js'], {
     QPAY_MOCK: '1',
     JETINNO_USERNAME: 'testname',
     JETINNO_APIKEY: 'DBRW17YE7FHKR72T',
-    PUBLIC_URL: `http://localhost:${PORT}`,
+    // Like Render: RENDER_EXTERNAL_URL and no PUBLIC_URL. The verification
+    // callback once read PUBLIC_URL alone and sent QPay "undefined/...".
+    PUBLIC_URL: undefined,
+    RENDER_EXTERNAL_URL: `http://localhost:${PORT}`,
     SUPABASE_URL: ISSUER_BASE,
     PORTAL_ORIGIN: 'https://kofe.mn',
     CRED_KEYS: `k1:${key()}`,

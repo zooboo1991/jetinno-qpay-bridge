@@ -64,6 +64,12 @@ function reqEnv(name) {
 
 const SUPABASE_URL = reqEnv('SUPABASE_URL').replace(/\/+$/, '');
 const PORTAL_ORIGIN = reqEnv('PORTAL_ORIGIN').replace(/\/+$/, ''); // e.g. https://kofe.mn
+// The same resolution server.js uses for sale callbacks. Render sets
+// RENDER_EXTERNAL_URL and not PUBLIC_URL; reading PUBLIC_URL alone sent QPay
+// "undefined/qpay/verify-callback", which it refuses — and every owner's
+// verification failed on a URL they never saw.
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL ?? '').replace(/\/+$/, '');
+if (!/^https?:\/\//.test(PUBLIC_URL)) throw new Error('PUBLIC_URL or RENDER_EXTERNAL_URL must be set — QPay needs a callback URL');
 const JWKS = createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`));
 
 /**
@@ -350,7 +356,7 @@ async function runVerification({ credentialId, ownerId, username, password, invo
       // settle path must be impossible, not merely unlikely: settle's
       // ref-is-not-a-uuid branch falls back to lookup by order_no, a namespace
       // a verify sender_invoice_no must never enter.
-      callbackUrl: `${process.env.PUBLIC_URL}/qpay/verify-callback`,
+      callbackUrl: `${PUBLIC_URL}/qpay/verify-callback`,
       signal: AbortSignal.timeout(TIMEOUT.invoice),
     });
   } catch (err) {
