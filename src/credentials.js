@@ -672,16 +672,39 @@ router.post('/credentials/verify', async (req, res) => {
       return reply(res, 409, begun.out_status.toUpperCase());
     }
 
+    // No read-back step. The business decided the owner's first sale is the
+    // check that the money lands where it should, so the staged credential is
+    // promoted at once — through the same SQL confirm the read-back used,
+    // with the nonce the bridge itself just generated. Every check that
+    // function makes (admin, duplicate merchant, state) still runs.
+    const conf = await store.confirmCredentialVerification({
+      credentialId, actorUserId, nonce,
+      remoteIp: req.ip, xff: req.get('x-forwarded-for'), userAgent: req.get('user-agent'),
+    });
+    // The probe invoice proved the invoice code; nobody needs to read it.
+    await cancelVerifyInvoice({ credentialId, ownerId, sealedBlob: v.sealed, invoiceId: v.invoiceId });
+    if (conf.out_status !== 'ok') {
+      outcome = 'rejected';
+      safeLog({ event: 'verify_rejected', ownerId, credentialId, actorUserId, outcome: conf.out_status });
+      await pad();
+      return reply(res, 409, String(conf.out_status).toUpperCase());
+    }
+
+    // Both caches forget the old merchant, as on a confirm.
+    qpay.evictOwner(conf.out_owner_id ?? ownerId);
+    owners.forgetCredential(credentialId);
+    // Detection, not prevention: the number on the sales paperwork hears
+    // about every change, whoever made it.
+    alerts.notifyOwnerCredentialChanged(ownerId).catch(() => {});
+    await store.revokeOtherSessions(actorUserId).catch(() => {});
+
     outcome = 'ok';
-    safeLog({ event: 'verify_started', ownerId, credentialId, actorUserId, outcome, ms: Date.now() - startedAt });
+    safeLog({ event: 'verify_activated', ownerId, credentialId, actorUserId, outcome, ms: Date.now() - startedAt });
     await pad();
     return reply(res, 200, 'OK', {
-      // The nonce is NOT returned. If the response carried it, the whole step
-      // would prove nothing: the page could show the owner a number to type
-      // back without them ever opening their portal.
-      expiresInMinutes: VERIFY_TTL_MINUTES,
-      amountMnt: VERIFY_AMOUNT_MNT,
-      usernameHint: v.usernameHint,
+      activated: true,
+      usernameHint: conf.out_username_hint ?? v.usernameHint,
+      liveInSeconds: 60,
     });
   } catch {
     safeLog({ event: 'unhandled', ownerId, credentialId, actorUserId, outcome: 'error', incident });

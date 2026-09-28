@@ -499,10 +499,24 @@ await check('QPay кодоос өөр шалтгаанаар татгалзва�
   ) || JSON.stringify({ r: r.json, row: rows[0] });
 });
 
-await check('эзэмшигчийн бичсэн зөв код QPay руу явж, баталгаажуулалт эхэлнэ', async () => {
+await check('зөв мэдээлэл → 4 оронтой кодгүйгээр ШУУД идэвхжинэ, туршилтын нэхэмжлэх цуцлагдана', async () => {
+  const cancelledBefore = qpayCalls.cancelled.length;
   const r = await verifyAs({ invoiceCode: 'KODGUI_INV_1' });
   const last = qpayCalls.invoice.at(-1);
-  return (r.status === 200 && last?.invoice_code === 'KODGUI_INV_1') || JSON.stringify(r.json);
+  const { rows } = await query(
+    `select status, is_active, sealed, verify_nonce, pending_sealed, pending_invoice_code from public.qpay_credentials where id = $1`,
+    [codelessCred]
+  );
+  const c = rows[0];
+  const audit = await query(
+    `select count(*)::int n from public.credential_audit where credential_id = $1 and action = 'verify_confirmed'`, [codelessCred]
+  );
+  return (
+    r.status === 200 && r.json?.activated === true && last?.invoice_code === 'KODGUI_INV_1' &&
+    c.status === 'active' && c.is_active === true && c.sealed?.startsWith('v1.') &&
+    c.verify_nonce === null && c.pending_sealed === null && c.pending_invoice_code === null &&
+    qpayCalls.cancelled.length === cancelledBefore + 1 && audit.rows[0].n === 1
+  ) || JSON.stringify({ r: r.json, c: c && { ...c, sealed: c.sealed?.slice(0, 4) } });
 });
 
 // ---- the operator configures an owner's QPay (migration 010) -------------------
