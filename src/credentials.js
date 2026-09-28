@@ -374,6 +374,32 @@ router.post('/invites/redeem', async (req, res) => {
 });
 
 // ===========================================================================
+// POST /owner/v1/invites/claim
+// Accepts every open invite that names the phone this user just proved.
+//
+// The operator registered a number; the person proved that number with an
+// SMS code; the two match — that IS the invitation, whichever way they
+// arrived. Only within minutes of the code (the token's own amr time), so a
+// session that has been open for a day cannot pick up an invite issued since.
+// ===========================================================================
+const CLAIM_WINDOW_SECONDS = 600;
+
+router.post('/invites/claim', async (req, res) => {
+  req.body = undefined;
+  const actor = await authenticate(req);
+  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  const now = Math.floor(Date.now() / 1000);
+  if (!actor.otpAt || now - actor.otpAt > CLAIM_WINDOW_SECONDS) return reply(res, 401, 'REAUTH_REQUIRED');
+
+  const claimed = await store.claimInvitesByPhone(actor.userId, req.ip);
+  if (claimed.length) await store.touchStepUp(actor.userId, 'invite_redeem');
+  safeLog({ event: 'invite_claim', actorUserId: actor.userId, outcome: String(claimed.length) });
+  return reply(res, 200, 'OK', {
+    owners: claimed.map((c) => ({ ownerId: c.out_owner_id, ownerName: c.out_owner_name, role: c.out_role })),
+  });
+});
+
+// ===========================================================================
 // GET  /owner/v1/step-up   — how fresh is this user's last OTP, and how fresh
 //                            does it need to be.
 // POST /owner/v1/step-up   — record an OTP the session JUST completed.

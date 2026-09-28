@@ -385,6 +385,53 @@ await check('утсыг жагсаалтаас хасахад эрх тэр да
   return r.status === 401;
 });
 
+// ---- claiming by phone (migration 012): no link needed --------------------------
+// The owner reached the portal without the link, proved the registered
+// number by SMS code — that match IS the invitation.
+const CLAIMER = randomUUID();
+const LATE = randomUUID();
+let claimOwner;
+await check('SMS-ээр баталгаажсан дугаар дээрх урилга холбоосгүйгээр хүлээн авагдана', async () => {
+  const reg = await call('/admin/v1/owners', {
+    token: op,
+    body: { ...newOwner, name: 'Холбоосгүй ХХК', contactPhone: '99554433', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
+  });
+  claimOwner = reg.json?.ownerId;
+  await call(`/admin/v1/owners/${claimOwner}/invite`, { token: op, body: {} });
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699554433',now())`, [CLAIMER]);
+  const r = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(CLAIMER) });
+  const m = await query(`select role from public.owner_members where owner_id = $1 and user_id = $2`, [claimOwner, CLAIMER]);
+  const me = await call('/owner/v1/me', { token: await mint(CLAIMER) });
+  return (
+    r.status === 200 && r.json?.owners?.[0]?.ownerId === claimOwner && m.rows[0]?.role === 'admin' &&
+    me.status === 200 && me.json?.owners?.[0]?.id === claimOwner
+  ) || JSON.stringify(r.json);
+});
+
+await check('хүлээн авсан урилгыг дахин авах зүйлгүй — давхар гишүүн үүсэхгүй', async () => {
+  const r = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(CLAIMER) });
+  const m = await query(`select count(*)::int n from public.owner_members where owner_id = $1`, [claimOwner]);
+  return r.json?.owners?.length === 0 && m.rows[0].n === 1;
+});
+
+await check('SMS код хуучин (10 минутаас дээш) бол урилга хүлээн авахгүй', async () => {
+  const r = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(CLAIMER, { otpAgo: 3600 }) });
+  return r.status === 401 && r.json?.code === 'REAUTH_REQUIRED';
+});
+
+await check('баталгаажаагүй утас, эсвэл өөр дугаар урилга авахгүй', async () => {
+  const reg = await call('/admin/v1/owners', {
+    token: op,
+    body: { ...newOwner, name: 'Хүлээгч ХХК', contactPhone: '99554400', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
+  });
+  await call(`/admin/v1/owners/${reg.json.ownerId}/invite`, { token: op, body: {} });
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699554400',null)`, [LATE]);
+  const unconfirmed = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(LATE) });
+  const stranger = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(IMPOSTOR) });
+  const m = await query(`select count(*)::int n from public.owner_members where owner_id = $1`, [reg.json.ownerId]);
+  return unconfirmed.json?.owners?.length === 0 && stranger.json?.owners?.length === 0 && m.rows[0].n === 0;
+});
+
 // ---- the operator configures an owner's QPay (migration 010) -------------------
 const creds = (extra = {}) => ({
   username: 'shinekofe', password: 'Merchant-Pass-9', invoiceCode: 'SHINE_INV_01', confirmOwnership: true, ...extra,

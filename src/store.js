@@ -325,6 +325,12 @@ export async function acceptOwnerInvite(token, userId, sourceIp) {
   return rows[0] ?? { out_status: 'not_found' };
 }
 
+/** Migration 012: open invites naming this user's CONFIRMED phone, accepted. */
+export async function claimInvitesByPhone(userId, sourceIp) {
+  const { rows } = await query(`select * from app.claim_invites_by_phone($1, $2::inet)`, [userId, sourceIp ?? null]);
+  return rows;
+}
+
 /** The credential slot the owner is about to fill, with the admin check applied. */
 export async function credentialSlot(credentialId, actorUserId) {
   const { rows } = await query(`select * from app.credential_slot($1, $2)`, [
