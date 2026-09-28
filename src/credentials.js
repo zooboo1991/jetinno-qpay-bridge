@@ -283,6 +283,21 @@ function qpayErrorCode(err) {
   return /^[A-Z_]{3,34}$/.test(code) ? code : null;
 }
 
+/**
+ * QPay's refusal as the operator needs to read it: status and the first
+ * 160 characters of its body, with the username and password cut out of it
+ * wherever they appear. Goes to the operator's alert list only — never to a
+ * response and never to the log.
+ */
+function qpayRefusalForOperator(err, { username, password }) {
+  const raw = String(err?.message ?? '');
+  let text = raw.replace(/^qpay invoice /, '').slice(0, 200);
+  for (const secret of [username, password]) {
+    if (secret && secret.length >= 3) text = text.split(secret).join('***');
+  }
+  return text.replace(/\s+/g, ' ').slice(0, 160);
+}
+
 /** Codes that mean the invoice code itself is what QPay refused. */
 const INVOICE_CODE_ERRORS = /INVOICE_CODE|INVOICE_NOT_FOUND|MERCHANT_INVOICE|INVALID_INVOICE/;
 
@@ -604,11 +619,13 @@ router.post('/credentials/verify', async (req, res) => {
           req.ip, req.get('user-agent')
         ).catch(() => {});
         safeLog({ event: 'verify_failed', ownerId, credentialId, actorUserId, outcome, status: qpayCode, incident });
+        // Without QPay's own words every refusal here looked the same — and
+        // was misreported as a wrong code. The operator gets them, scrubbed.
+        alerts.pageOperator(`QPay verification invoice refused: ${qpayRefusalForOperator(err, fields)}`, { ownerId, credentialId });
         if (!codeProblem) {
           // QPay accepted the login and refused the invoice for some other
           // reason. Saying "wrong invoice code" here sends the owner to retype
           // a code that was right; say what QPay said instead.
-          alerts.pageOperator(`QPay refused the verification invoice: ${qpayCode}`, { ownerId, credentialId });
           await pad();
           return reply(res, 400, 'INVOICE_FAILED', { qpayError: qpayCode });
         }

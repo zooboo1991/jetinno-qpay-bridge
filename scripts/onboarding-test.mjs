@@ -485,7 +485,10 @@ await check('QPay кодоос өөр шалтгаанаар татгалзва�
   const { rows } = await query(`select last_error_code from public.qpay_credentials where id = $1`, [codelessCred]);
   return (
     r.json?.code === 'INVOICE_FAILED' && r.json?.qpayError === 'INVALID_AMOUNT' &&
-    rows[0]?.last_error_code === 'QPAY_INVALID_AMOUNT' && !log.includes('kodgui_merchant')
+    rows[0]?.last_error_code === 'QPAY_INVALID_AMOUNT' && !log.includes('kodgui_merchant') &&
+    // The operator's alert carries QPay's words with the username cut out.
+    (await query(`select reason from public.ingest_errors where reason like '%amount below minimum%' order by at desc limit 1`))
+      .rows[0]?.reason?.includes('***: amount below minimum') === true
   ) || JSON.stringify({ r: r.json, row: rows[0] });
 });
 
