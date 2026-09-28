@@ -261,6 +261,32 @@ function classify(err) {
 }
 
 /**
+ * QPay's own error code from a failed invoice call — `INVOICE_CODE_INVALID`
+ * and the like — and nothing else from its body.
+ *
+ * The body is never logged (QPay echoes the merchant username), but its code
+ * is the one thing that tells "the invoice code is wrong" apart from every
+ * other refusal, and without it every refusal was reported as a wrong code.
+ * Only an all-caps token survives; anything else is dropped.
+ */
+function qpayErrorCode(err) {
+  const raw = String(err?.message ?? '');
+  const body = raw.slice(raw.indexOf(': ') + 2);
+  let code = '';
+  try {
+    const j = JSON.parse(body);
+    code = String(j?.error ?? j?.code ?? j?.message ?? '');
+  } catch {
+    code = /\b([A-Z][A-Z_]{2,38})\b/.exec(body)?.[1] ?? '';
+  }
+  code = code.trim().toUpperCase();
+  return /^[A-Z_]{3,34}$/.test(code) ? code : null;
+}
+
+/** Codes that mean the invoice code itself is what QPay refused. */
+const INVOICE_CODE_ERRORS = /INVOICE_CODE|INVOICE_NOT_FOUND|MERCHANT_INVOICE|INVALID_INVOICE/;
+
+/**
  * The verification itself. Three proofs, in increasing order of what they buy:
  *
  *   1. token      — proves username + password. Proves nothing about the
@@ -569,17 +595,31 @@ router.post('/credentials/verify', async (req, res) => {
         return reply(res, 400, 'AUTH_FAILED');
       }
       if (err?.stage === 'invoice') {
-        outcome = 'invoice_code_failed';
-        await store.recordVerifyFailure(credentialId, actorUserId, 'QPAY_INVOICE_CODE_REJECTED', req.ip, req.get('user-agent')).catch(() => {});
+        const qpayCode = qpayErrorCode(err);
+        const codeProblem = !qpayCode || INVOICE_CODE_ERRORS.test(qpayCode);
+        outcome = codeProblem ? 'invoice_code_failed' : 'invoice_failed';
+        await store.recordVerifyFailure(
+          credentialId, actorUserId,
+          qpayCode ? `QPAY_${qpayCode}`.slice(0, 40) : 'QPAY_INVOICE_CODE_REJECTED',
+          req.ip, req.get('user-agent')
+        ).catch(() => {});
+        safeLog({ event: 'verify_failed', ownerId, credentialId, actorUserId, outcome, status: qpayCode, incident });
+        if (!codeProblem) {
+          // QPay accepted the login and refused the invoice for some other
+          // reason. Saying "wrong invoice code" here sends the owner to retype
+          // a code that was right; say what QPay said instead.
+          alerts.pageOperator(`QPay refused the verification invoice: ${qpayCode}`, { ownerId, credentialId });
+          await pad();
+          return reply(res, 400, 'INVOICE_FAILED', { qpayError: qpayCode });
+        }
         // Whose typo it was decides the message: the owner can retype their
         // own code, but only the operator can fix one entered at registration
         // — and is paged for it.
         if (codeFrom === 'operator') {
           alerts.pageOperator('invoice_code rejected by QPay — operator entered it', { ownerId, credentialId });
         }
-        safeLog({ event: 'verify_failed', ownerId, credentialId, actorUserId, outcome, incident });
         await pad();
-        return reply(res, 400, 'INVOICE_CODE_FAILED', { enteredBy: codeFrom });
+        return reply(res, 400, 'INVOICE_CODE_FAILED', { enteredBy: codeFrom, qpayError: qpayCode });
       }
       // `err` is classified and then dropped. It is NEVER logged: QPay's 401
       // body echoes the merchant username and pg errors echo statement text.
@@ -859,7 +899,11 @@ operatorRouter.post('/owners/:ownerId/credentials', async (req, res) => {
       safeLog({ event: 'operator_verify_failed', ownerId, credentialId, actorUserId, outcome: kind, incident });
       if (kind === 'qpay_unreachable') return reply(res, 502, 'QPAY_UNREACHABLE');
       if (kind === 'auth_failed') return reply(res, 400, 'AUTH_FAILED');
-      if (err?.stage === 'invoice') return reply(res, 400, 'INVOICE_CODE_FAILED');
+      if (err?.stage === 'invoice') {
+        const qpayCode = qpayErrorCode(err);
+        if (qpayCode && !INVOICE_CODE_ERRORS.test(qpayCode)) return reply(res, 400, 'INVOICE_FAILED', { qpayError: qpayCode });
+        return reply(res, 400, 'INVOICE_CODE_FAILED', { qpayError: qpayCode });
+      }
       return reply(res, 500, 'SERVER_ERROR', { incident });
     }
 

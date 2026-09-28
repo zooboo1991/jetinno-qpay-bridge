@@ -85,6 +85,12 @@ const qpayFake = createServer((req, res) => {
       const body = JSON.parse(raw || '{}');
       qpayCalls.invoice.push(body);
       if (body.invoice_code === 'BAD_CODE') { res.statusCode = 400; return res.end('{"error":"INVOICE_CODE_INVALID"}'); }
+      // A refusal that is NOT about the invoice code. The body echoes a
+      // username, as QPay's can — it must not reach the database or the log.
+      if (body.invoice_code === 'OTHER_REFUSAL') {
+        res.statusCode = 400;
+        return res.end('{"error":"INVALID_AMOUNT","message":"kodgui_merchant: amount below minimum"}');
+      }
       return res.end(JSON.stringify({ invoice_id: `inv-${qpayCalls.invoice.length}`, qPay_shortUrl: 'https://s.qpay.mn/x' }));
     }
     if (req.url.startsWith('/v2/invoice/') && req.method === 'DELETE') {
@@ -472,6 +478,15 @@ await check('эзэмшигчийн өөрийн бичсэн код буруу 
   const r = await verifyAs({ invoiceCode: 'BAD_CODE' });
   const alertsAfter = (await query(`select count(*)::int n from public.ingest_errors where reason like '%operator entered it%'`)).rows[0].n;
   return r.json?.code === 'INVOICE_CODE_FAILED' && r.json?.enteredBy === 'owner' && alertsAfter === alertsBefore;
+});
+
+await check('QPay кодоос өөр шалтгаанаар татгалзвал «код буруу» гэж ХЭЛЭХГҮЙ, шалтгааныг хадгална', async () => {
+  const r = await verifyAs({ invoiceCode: 'OTHER_REFUSAL' });
+  const { rows } = await query(`select last_error_code from public.qpay_credentials where id = $1`, [codelessCred]);
+  return (
+    r.json?.code === 'INVOICE_FAILED' && r.json?.qpayError === 'INVALID_AMOUNT' &&
+    rows[0]?.last_error_code === 'QPAY_INVALID_AMOUNT' && !log.includes('kodgui_merchant')
+  ) || JSON.stringify({ r: r.json, row: rows[0] });
 });
 
 await check('эзэмшигчийн бичсэн зөв код QPay руу явж, баталгаажуулалт эхэлнэ', async () => {
