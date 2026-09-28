@@ -282,6 +282,9 @@ export async function ownersByIds(ownerIds) {
                         from public.machines m
                        where m.owner_id = o.id and m.status <> 'retired'), '[]'::json) as machines,
             c.id                as credential_id,
+            -- Whether the operator already entered the invoice code, so the
+            -- owner's form can say it is optional. The code itself stays here.
+            (c.pending_invoice_code is not null) as credential_invoice_code_set,
             c.status            as credential_status,
             c.is_active         as credential_active,
             c.username_hint     as credential_username_hint,
@@ -291,7 +294,7 @@ export async function ownersByIds(ownerIds) {
        from public.owners o
        left join lateral (
          select qc.id, qc.status, qc.is_active, qc.username_hint,
-                qc.last_verified_at, qc.verify_expires_at
+                qc.last_verified_at, qc.verify_expires_at, qc.pending_invoice_code
            from public.qpay_credentials qc
           where qc.owner_id = o.id
           order by qc.is_active desc, qc.updated_at desc

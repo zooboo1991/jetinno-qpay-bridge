@@ -432,6 +432,54 @@ await check('баталгаажаагүй утас, эсвэл өөр дугаа
   return unconfirmed.json?.owners?.length === 0 && stranger.json?.owners?.length === 0 && m.rows[0].n === 0;
 });
 
+// ---- the owner types the invoice code (migration 013) ----------------------------
+const CODELESS = randomUUID();
+let codelessOwner;
+let codelessCred;
+await check('нэхэмжлэхийн кодгүйгээр бүртгэж болно', async () => {
+  const reg = await call('/admin/v1/owners', {
+    token: op,
+    body: { ...newOwner, name: 'Кодгүй ХХК', contactPhone: '99553322', invoiceCode: '', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
+  });
+  codelessOwner = reg.json?.ownerId;
+  const { rows } = await query(`select id, pending_invoice_code from public.qpay_credentials where owner_id = $1`, [codelessOwner]);
+  codelessCred = rows[0]?.id;
+  return reg.json?.status === 'ok' && rows[0]?.pending_invoice_code === null;
+});
+
+await check('/me кодыг оператор оруулсан эсэхийг хэлнэ (кодыг өөрийг нь биш)', async () => {
+  await call(`/admin/v1/owners/${codelessOwner}/invite`, { token: op, body: {} });
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699553322',now())`, [CODELESS]);
+  await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(CODELESS) });
+  const me = await call('/owner/v1/me', { token: await mint(CODELESS) });
+  const o = me.json?.owners?.[0];
+  return o?.credential_invoice_code_set === false && !JSON.stringify(me.json).includes('pending_invoice_code');
+});
+
+const verifyAs = async (fields) =>
+  call('/owner/v1/credentials/verify', {
+    token: await mint(CODELESS),
+    body: { credentialId: codelessCred, username: 'kodgui_merchant', password: 'Kodgui-Pass-1', ...fields },
+  });
+
+await check('кодгүй слот дээр эзэмшигч кодоо бичээгүй бол ойлгомжтой татгалзана', async () => {
+  const r = await verifyAs({});
+  return r.status === 400 && r.json?.field === 'invoiceCode';
+});
+
+await check('эзэмшигчийн өөрийн бичсэн код буруу бол «таны код» гэж хэлнэ, операторыг сэрээхгүй', async () => {
+  const alertsBefore = (await query(`select count(*)::int n from public.ingest_errors where reason like '%operator entered it%'`)).rows[0].n;
+  const r = await verifyAs({ invoiceCode: 'BAD_CODE' });
+  const alertsAfter = (await query(`select count(*)::int n from public.ingest_errors where reason like '%operator entered it%'`)).rows[0].n;
+  return r.json?.code === 'INVOICE_CODE_FAILED' && r.json?.enteredBy === 'owner' && alertsAfter === alertsBefore;
+});
+
+await check('эзэмшигчийн бичсэн зөв код QPay руу явж, баталгаажуулалт эхэлнэ', async () => {
+  const r = await verifyAs({ invoiceCode: 'KODGUI_INV_1' });
+  const last = qpayCalls.invoice.at(-1);
+  return (r.status === 200 && last?.invoice_code === 'KODGUI_INV_1') || JSON.stringify(r.json);
+});
+
 // ---- the operator configures an owner's QPay (migration 010) -------------------
 const creds = (extra = {}) => ({
   username: 'shinekofe', password: 'Merchant-Pass-9', invoiceCode: 'SHINE_INV_01', confirmOwnership: true, ...extra,

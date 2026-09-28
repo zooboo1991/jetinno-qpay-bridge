@@ -213,6 +213,7 @@ function otpTimestamp(payload) {
 // never cost a budgeted attempt or a round trip to Ulaanbaatar.
 // ---------------------------------------------------------------------------
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const INVOICE_CODE = /^[A-Za-z0-9_-]{3,64}$/;
 const PRINTABLE = /^[\x21-\x7e]+$/; // no spaces, no control chars, no unicode lookalikes
 
 function readCredentialFields(body) {
@@ -484,11 +485,20 @@ router.post('/credentials/verify', async (req, res) => {
     }
     ownerId = slot.out_owner_id;
 
-    if (!slot.out_pending_invoice_code) {
-      // The operator has not filled the invoice code on this slot. An owner
-      // cannot fix that and must not be shown a field for it.
+    // QPay hands the owner three things together: username, password and
+    // invoice code. The owner may type the code; if they leave it blank the
+    // one the operator entered at registration is used. Theirs wins when both
+    // exist, so a wrong operator entry is something the owner can fix.
+    const typedCode = String(body?.invoiceCode ?? '').trim();
+    if (typedCode && !INVOICE_CODE.test(typedCode)) {
       await pad();
-      return reply(res, 409, 'SLOT_INCOMPLETE');
+      return reply(res, 400, 'INVALID_INPUT', { field: 'invoiceCode' });
+    }
+    const invoiceCode = typedCode || slot.out_pending_invoice_code;
+    const codeFrom = typedCode ? 'owner' : 'operator';
+    if (!invoiceCode) {
+      await pad();
+      return reply(res, 400, 'INVALID_INPUT', { field: 'invoiceCode' });
     }
 
     // Step-up. First entry rides the redemption OTP; a change needs a fresh one.
@@ -534,7 +544,7 @@ router.post('/credentials/verify', async (req, res) => {
         ownerId,
         username: fields.username,
         password: fields.password,
-        invoiceCode: slot.out_pending_invoice_code,
+        invoiceCode,
         nonce,
       });
     } catch (err) {
@@ -561,13 +571,15 @@ router.post('/credentials/verify', async (req, res) => {
       if (err?.stage === 'invoice') {
         outcome = 'invoice_code_failed';
         await store.recordVerifyFailure(credentialId, actorUserId, 'QPAY_INVOICE_CODE_REJECTED', req.ip, req.get('user-agent')).catch(() => {});
-        // The owner never typed this value — the operator did, at invite time.
-        // The portal's copy for this code blames the operator and gives his
-        // number, and the operator is paged, because the owner cannot fix it.
-        alerts.pageOperator('invoice_code rejected by QPay — operator entered it', { ownerId, credentialId });
+        // Whose typo it was decides the message: the owner can retype their
+        // own code, but only the operator can fix one entered at registration
+        // — and is paged for it.
+        if (codeFrom === 'operator') {
+          alerts.pageOperator('invoice_code rejected by QPay — operator entered it', { ownerId, credentialId });
+        }
         safeLog({ event: 'verify_failed', ownerId, credentialId, actorUserId, outcome, incident });
         await pad();
-        return reply(res, 400, 'INVOICE_CODE_FAILED');
+        return reply(res, 400, 'INVOICE_CODE_FAILED', { enteredBy: codeFrom });
       }
       // `err` is classified and then dropped. It is NEVER logged: QPay's 401
       // body echoes the merchant username and pg errors echo statement text.
@@ -794,7 +806,6 @@ router.get('/credentials/:credentialId', async (req, res) => {
 // passes a verified operator through to here; this route checks again itself.
 // ===========================================================================
 const OPERATOR_STEP_UP_SECONDS = 600;
-const INVOICE_CODE = /^[A-Za-z0-9_-]{3,64}$/;
 
 export const operatorRouter = express.Router();
 
