@@ -258,6 +258,54 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     return { status };
   }));
 
+  // -------------------------------------------------------------------------
+  // Machine faults (migration 015). The portal parses Jetinno's SaaS export
+  // and posts the rows; each row is checked again here, because a JSON body
+  // from a browser session is not something to hand to SQL on trust.
+  // -------------------------------------------------------------------------
+  const bigJson = express.json({ limit: '6mb', type: 'application/json' });
+  const DEVICE = /^[A-Za-z0-9_-]{1,40}$/;
+  const clip = (v, n) => (v === null || v === undefined || v === '' ? null : String(v).slice(0, n));
+  const isoOrNull = (v) => {
+    if (!v) return null;
+    const d = new Date(String(v));
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  };
+
+  router.post('/faults/import', bigJson, handler('faults import', async (req) => {
+    const input = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!input || input.length > 20000) return { status: 'invalid' };
+    const rows = [];
+    let skipped = 0;
+    for (const r of input) {
+      const deviceNo = String(r?.deviceNo ?? '').trim();
+      const occurredAt = isoOrNull(r?.occurredAt);
+      if (!DEVICE.test(deviceNo) || !occurredAt) { skipped += 1; continue; }
+      rows.push({
+        deviceNo,
+        occurredAt,
+        code: clip(String(r?.code ?? '').trim(), 60) ?? '',
+        description: clip(r?.description, 300),
+        resolvedAt: isoOrNull(r?.resolvedAt),
+        status: clip(r?.status, 60),
+      });
+    }
+    const out = await store.operatorImportFaults(req.operator.userId, clip(req.body?.fileName, 200), rows);
+    log('admin faults import', out.out_status, `read=${out.out_read} added=${out.out_added} updated=${out.out_updated} skipped=${skipped}`);
+    return {
+      status: out.out_status,
+      read: input.length,
+      added: out.out_added ?? 0,
+      updated: out.out_updated ?? 0,
+      skipped,
+    };
+  }));
+
+  router.get('/faults', handler('faults', async (req) => ({
+    faults: await store.operatorFaults(req.operator.userId, Number(req.query.limit) || 200),
+    imports: await store.operatorFaultImports(req.operator.userId),
+  })));
+
   /** Am I an operator? The portal asks this to decide whether to show the link. */
   router.get('/me', (req, res) => res.json({ userId: req.operator.userId, isOperator: true }));
 

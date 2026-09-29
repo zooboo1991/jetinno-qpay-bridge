@@ -750,6 +750,24 @@ export async function recordSmsSend(phone, purpose, ok, status, error, reply) {
   await query(`select app.record_sms_send($1, $2, $3, $4, $5, $6)`, [phone, purpose, ok, status, error, reply]);
 }
 
+/** Migration 015: machine faults exported from Jetinno's SaaS. */
+export async function operatorImportFaults(actorUserId, fileName, rows) {
+  const { rows: r } = await query(`select * from app.operator_import_faults($1,$2,$3::jsonb)`, [
+    actorUserId, fileName ?? null, JSON.stringify(rows),
+  ]);
+  return r[0] ?? { out_status: 'error' };
+}
+
+export async function operatorFaults(actorUserId, limit) {
+  const { rows } = await query(`select * from app.operator_faults($1,$2)`, [actorUserId, limit ?? 200]);
+  return rows;
+}
+
+export async function operatorFaultImports(actorUserId) {
+  const { rows } = await query(`select * from app.operator_fault_imports($1)`, [actorUserId]);
+  return rows;
+}
+
 /** Migration 010: the slot an operator is about to fill for an owner. */
 export async function operatorCredentialSlot(actorUserId, ownerId) {
   const { rows } = await query(`select * from app.operator_credential_slot($1,$2)`, [actorUserId, ownerId]);

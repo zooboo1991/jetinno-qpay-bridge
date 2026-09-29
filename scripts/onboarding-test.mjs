@@ -585,6 +585,57 @@ await check('нэг QPay дансыг өөр харилцагчид давхар
   return (r.status === 409 && r.json?.code === 'DUPLICATE_OTHER_OWNER') || JSON.stringify(r.json);
 });
 
+// ---- machine faults imported from Jetinno's SaaS (migration 015) -----------------
+const faultRows = [
+  { deviceNo: DEVICE, code: 'E07', description: 'Ус дууссан', occurredAt: '2026-09-28T09:15:00+08:00' },
+  { deviceNo: DEVICE, code: 'E12', description: 'Кофены үр дууссан', occurredAt: '2026-09-28T10:00:00+08:00' },
+  { deviceNo: 'bad device!', code: 'E01', occurredAt: '2026-09-28T10:00:00+08:00' },
+];
+
+await check('оператор биш хүн алдаа импортлож ЧАДАХГҮЙ', async () => {
+  const r = await call('/admin/v1/faults/import', { token: await mint(OWNER), body: { rows: faultRows } });
+  const n = (await query(`select count(*)::int n from public.machine_faults`)).rows[0].n;
+  return r.status === 401 && n === 0;
+});
+
+await check('импорт: зөв мөрүүд нэмэгдэнэ, буруу мөр алгасагдана', async () => {
+  const r = await call('/admin/v1/faults/import', { token: op, body: { fileName: 'faults.xlsx', rows: faultRows } });
+  return (r.json?.status === 'ok' && r.json.added === 2 && r.json.skipped === 1) || JSON.stringify(r.json);
+});
+
+await check('ижил файлыг дахин импортлоход давхардахгүй', async () => {
+  const r = await call('/admin/v1/faults/import', { token: op, body: { rows: faultRows.slice(0, 2) } });
+  const n = (await query(`select count(*)::int n from public.machine_faults where device_no = $1`, [DEVICE])).rows[0].n;
+  return r.json?.added === 0 && r.json?.updated === 2 && n === 2;
+});
+
+await check('эзэмшигчийн «Асуудал»-д өөрийн машины шийдэгдээгүй алдаа гарна', async () => {
+  await query(`update public.machine_faults set occurred_at = date_trunc('second', now() - interval '1 hour') where device_no = $1`, [DEVICE]);
+  const r = await call(`/owner/v1/problems`, { token: await mint(OWNER) });
+  const f = (r.json?.problems ?? []).filter((p) => p.kind === 'machine_fault');
+  return (f.length === 2 && f.some((p) => p.detail === 'E07 · Ус дууссан')) || JSON.stringify(r.json);
+});
+
+await check('шийдэгдсэн алдаа эзэмшигчид харагдахгүй болно', async () => {
+  const at = (await query(`select occurred_at from public.machine_faults where code = 'E07' and device_no = $1`, [DEVICE])).rows[0].occurred_at;
+  await call('/admin/v1/faults/import', {
+    token: op, body: { rows: [{ deviceNo: DEVICE, code: 'E07', occurredAt: at.toISOString(), resolvedAt: new Date().toISOString() }] },
+  });
+  const r = await call(`/owner/v1/problems`, { token: await mint(OWNER) });
+  const f = (r.json?.problems ?? []).filter((p) => p.kind === 'machine_fault');
+  return f.length === 1 && f[0].detail.startsWith('E12');
+});
+
+await check('өөр эзэмшигчийн машины алдаа харагдахгүй', async () => {
+  const r = await call(`/owner/v1/problems`, { token: await mint(CLAIMER) });
+  return !(r.json?.problems ?? []).some((p) => p.kind === 'machine_fault');
+});
+
+await check('операторын жагсаалтад эзэмшигчийн нэртэй', async () => {
+  const r = await call('/admin/v1/faults', { token: op });
+  return r.json?.faults?.[0]?.owner_name === 'Шинэ Кофе ХХК' && r.json?.imports?.length >= 1;
+});
+
 bridge.kill();
 jwks.close();
 qpayFake.close();
