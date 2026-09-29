@@ -409,8 +409,12 @@ router.post('/invites/redeem', async (req, res) => {
   safeLog({ event: 'invite_redeem', actorUserId: actor.userId, outcome: r.out_status });
 
   if (r.out_status === 'accepted' || r.out_status === 'already_accepted') {
-    // THIS is what makes the credential screen openable without a second SMS.
-    await store.touchStepUp(actor.userId, 'invite_redeem');
+    // THIS is what makes the credential screen openable without a second SMS
+    // — but only for a session that has just proved the phone by SMS. An old
+    // invite link re-redeemed from a password session (already_accepted
+    // answers forever) must not stand in for that code.
+    const now = Math.floor(Date.now() / 1000);
+    if (actor.otpAt && now - actor.otpAt <= STEP_UP_RECORD_WINDOW_SECONDS) await store.touchStepUp(actor.userId, 'invite_redeem');
     return reply(res, 200, 'OK', {
       status: r.out_status, ownerId: r.out_owner_id, ownerName: r.out_owner_name, role: r.out_role,
     });

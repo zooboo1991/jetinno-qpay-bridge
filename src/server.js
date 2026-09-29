@@ -1,4 +1,5 @@
 import express from 'express';
+import './async-errors.js';
 import { SIGNABLE, buildSign, verifySign, flatten, timestamp } from './sign.js';
 import * as qpay from './qpay.js';
 import * as db from './db.js';
@@ -179,11 +180,12 @@ function notifyUrlAllowed(raw) {
  * account, so this is the routing decision for actual money:
  *
  *   owner client   — the machine is registered and its credential is usable.
- *   env fallback   — no database, database unreachable, or a device nobody
- *                    has registered. The operator's own merchant takes the
- *                    sale; for an unregistered device that is today's exact
- *                    behavior, and for a database blip it keeps coffee
- *                    working — the Map-decides rule extends to routing.
+ *   env fallback   — no database configured, or a device the database says
+ *                    nobody has registered. The operator's own merchant
+ *                    takes the sale.
+ *   db unreachable — the last answer seen for that device (owners.js), or a
+ *                    refusal. Never the env merchant: that would put an
+ *                    owner's money in the operator's account.
  *   refusal        — the machine IS registered but its credential, owner or
  *                    machine row is disabled. Falling back to env here would
  *                    take a known owner's money into the operator's account,
@@ -205,8 +207,12 @@ async function merchantFor(deviceNo, orderNo) {
     // moment a credential is promoted.
     machine = await owners.resolveMachine(deviceNo);
   } catch (err) {
-    log('merchant resolve failed, env fallback', deviceNo, err.message.split('\n')[0]);
-    return { client: null, source: 'env-db-down' };
+    // The database cannot say whose machine this is (owners.js already served
+    // any answer it had seen). Every machine sold today belongs to an owner,
+    // so the operator's merchant here would most likely take an owner's money:
+    // one refused cup — the customer taps again — is the smaller harm.
+    log('merchant resolve failed, refusing', deviceNo, err.message.split('\n')[0]);
+    return { refused: 'DB_UNAVAILABLE' };
   }
 
   if (!machine) {
@@ -242,12 +248,7 @@ async function merchantFor(deviceNo, orderNo) {
       context: credentialAad({ credentialId: machine.qpay_credential_id, ownerId: machine.owner_id }),
     });
     return {
-      client: qpay.clientFor({
-        username: cred.username,
-        password: cred.password,
-        invoiceCode: cred.invoice_code,
-        cacheKey: machine.qpay_credential_id,
-      }),
+      client: qpay.clientForSealed(cred, machine.qpay_credential_id),
       source: 'owner',
       machine,
     };
@@ -532,17 +533,16 @@ async function rehydrateOrder(orderNo) {
         const plain = open(cred.sealed, {
           context: credentialAad({ credentialId: row.qpay_credential_id, ownerId: cred.owner_id }),
         });
-        order.qpay = qpay.clientFor({
-          username: plain.username,
-          password: plain.password,
-          invoiceCode: plain.invoice_code,
-          cacheKey: row.qpay_credential_id,
-        });
+        order.qpay = qpay.clientForSealed(plain, row.qpay_credential_id);
       } catch (err) {
         log('rehydrate: unseal failed', orderNo, err.message.split('\n')[0]);
         return null;
       }
     }
+    // Another path may have rebuilt it while this one awaited the database.
+    // One order object per orderNo is what makes the `settling` flag work.
+    const existing = orders.get(orderNo);
+    if (existing) return existing;
     orders.set(orderNo, order);
     log('order rehydrated from db', orderNo, `was ${row.status}`);
     return order;
@@ -552,12 +552,28 @@ async function rehydrateOrder(orderNo) {
   }
 }
 
+/*
+ * QPay fires its callback more than once, and after a restart every one of
+ * them misses the Map at the same moment. Each would rebuild its own order
+ * object, pass its own `settling` flag and notify the machine — two coffees
+ * for one payment. Concurrent misses share one rebuild instead.
+ */
+const rehydrating = new Map();
+function rehydrateOnce(orderNo) {
+  let pending = rehydrating.get(orderNo);
+  if (!pending) {
+    pending = rehydrateOrder(orderNo).finally(() => rehydrating.delete(orderNo));
+    rehydrating.set(orderNo, pending);
+  }
+  return pending;
+}
+
 async function settle(orderNo) {
   let order = orders.get(orderNo);
   // The Map is empty after every restart — and Render restarts the process on
   // every deploy. A paid order must survive that, so a miss falls back to the
   // dual-written Postgres row, which carries everything a settle needs.
-  if (!order && DUAL_WRITE) order = await rehydrateOrder(orderNo);
+  if (!order && DUAL_WRITE) order = await rehydrateOnce(orderNo);
   if (!order) return { ok: false, reason: 'unknown order' };
   if (order.pending || order.status === 'creating') return { ok: false, reason: 'not paid yet' };
   if (order.status === 'paid') return { ok: true, already: true };
@@ -570,6 +586,15 @@ async function settle(orderNo) {
       // check under the owner's merchant, env orders under the operator's.
       const { paid, paymentId, amount } = await (order.qpay ?? qpay).checkPayment(order.invoiceId);
       if (!paid) return { ok: false, reason: 'not paid yet' };
+      // QPay invoices are fixed-amount, so this should never fire — which is
+      // exactly why a payment below the invoice must not brew quietly.
+      if (Number.isFinite(amount) && amount < order.amountMnt) {
+        log('underpaid, not brewing', orderNo, `${amount} < ${order.amountMnt}`);
+        dw('ingestError', () =>
+          store.logIngestError({ path: '/qpay/callback', deviceNo: order.deviceNo, orderNo, reason: 'UNDERPAID' })
+        );
+        return { ok: false, reason: 'underpaid' };
+      }
       order.paymentRef = paymentId;
       order.paidAmount = amount;
     } else {
@@ -988,4 +1013,25 @@ const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS ?? 60_000);
 setInterval(() => sweepAbandoned().catch((e) => log('sweep error', e.message)), SWEEP_INTERVAL_MS).unref();
 
 const port = process.env.PORT ?? 3000;
+/*
+ * The last stop for anything a route threw or rejected. body-parser attaches
+ * the raw request text to its errors as err.body — for a credential route
+ * that is a merchant password — so it is dropped before anything reads err.
+ * The request gets a plain answer; the process keeps selling coffee.
+ */
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  delete err.body;
+  log('request failed', req.method, req.path, String(err?.message ?? err).split('\n')[0]);
+  if (res.headersSent) return res.end();
+  const status = err.status >= 400 && err.status < 500 ? err.status : 503;
+  res.status(status).json({ ok: false, code: status === 503 ? 'UNAVAILABLE' : 'BAD_REQUEST' });
+});
+
+// A rejection nobody awaited (a fire-and-forget mirror write) is logged, not
+// fatal: exiting would drop every live order held in memory.
+process.on('unhandledRejection', (err) => {
+  log('unhandled rejection', String(err?.message ?? err).split('\n')[0]);
+});
+
 app.listen(port, () => log(`listening :${port} mock=${MOCK} qpay=${qpay.qpayConfigured()} public=${PUBLIC_URL}`));

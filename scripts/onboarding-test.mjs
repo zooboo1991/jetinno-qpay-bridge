@@ -328,6 +328,16 @@ await check('урилга хүлээн авах нь step-up-д тооцогдо
   return r.json?.ageSeconds < 60 && r.json?.firstEntryMaxSeconds === 3600;
 });
 
+await check('хуучин урилгын линкийг нууц үгийн сессээс дахин нээхэд step-up өгөхгүй', async () => {
+  // already_accepted answers forever; without the OTP-time gate an old SMS
+  // link plus a password would stand in for the SMS code a QPay change needs.
+  await query(`update public.owner_step_up set last_otp_at = now() - interval '2 hours' where user_id = $1`, [OWNER]);
+  const r = await call('/owner/v1/invites/redeem', { token: await mint(OWNER, { otpAgo: null }), body: { token: second.token } });
+  const age = await call('/owner/v1/step-up', { token: await mint(OWNER) });
+  return (r.status === 200 && r.json?.status === 'already_accepted' && age.json?.ageSeconds > 3600) ||
+    `${r.status} ${r.json?.status} age=${age.json?.ageSeconds}`;
+});
+
 await check('step-up: OTP-ийн цаг токенд байхгүй бол бүртгэхгүй', async () => {
   const r = await call('/owner/v1/step-up', { method: 'POST', token: await mint(OWNER, { otpAgo: null }) });
   return r.status === 401 && r.json?.code === 'REAUTH_REQUIRED';
@@ -645,4 +655,6 @@ await close();
 const passed = results.filter(([ok]) => ok).length;
 for (const [ok, name, extra] of results) console.log(`  ${ok ? '✓' : '✗'} ${name}${ok ? '' : extra}`);
 console.log(`\n  ${passed}/${results.length} давлаа`);
+// A failure with the bridge's own last words beside it, not a bare 'fetch failed'.
+if (passed !== results.length) console.log('\n--- bridge log (tail) ---\n' + log.slice(-2500));
 process.exit(passed === results.length ? 0 : 1);

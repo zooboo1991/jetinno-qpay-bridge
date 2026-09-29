@@ -16,6 +16,7 @@ process.env.CRED_KEY_ACTIVE ??= 'k1';
 process.env.CRED_FP_KEY ??= randomBytes(32).toString('base64');
 
 const c = await import('../src/crypto.js');
+const qpay = await import('../src/qpay.js');
 c.assertCryptoUsable();
 
 const A = c.credentialAad({ credentialId: 'cred_1', ownerId: 'own_1' });
@@ -59,6 +60,24 @@ const checks = [
   ['fingerprint case-insensitive on username', () => id('Coffeine', 'INV_123') === id('coffeine', 'INV_123')],
   ['fingerprint trims surrounding space', () => id(' coffeine ', 'INV_123') === id('coffeine', 'INV_123')],
   ['fingerprint is keyed, not a bare hash', () => id('coffeine', 'INV_123').length === 64],
+  // What a sale does with a sealed credential. The portal seals `invoiceCode`,
+  // the CLI sealed `invoice_code`; a sale must work for both, and only these.
+  [
+    'sale opens a portal-sealed credential (invoiceCode)',
+    () => Boolean(qpay.clientForSealed(c.open(c.seal({ username: 'u', password: 'p', invoiceCode: 'INV_1' }, { context: A }), { context: A }), 'cred_1')),
+  ],
+  ['sale opens a CLI-sealed credential (invoice_code)', () => Boolean(qpay.clientForSealed(c.open(blob, { context: A }), 'cred_1'))],
+  [
+    'sale refuses a credential with no invoice code',
+    () => {
+      try {
+        qpay.clientForSealed({ username: 'u', password: 'p' }, 'x');
+        return false;
+      } catch (err) {
+        return err.message === 'QPAY_CREDENTIAL_INCOMPLETE';
+      }
+    },
+  ],
 ];
 
 let passed = 0;

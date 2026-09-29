@@ -19,7 +19,8 @@
     "test:cache": "bash scripts/cache-test.sh",
     "preflight": "node --env-file=.env scripts/preflight.mjs",
     "test:operator": "bash scripts/operator-test.sh",
-    "test:onboarding": "bash scripts/onboarding-test.sh"
+    "test:onboarding": "bash scripts/onboarding-test.sh",
+    "test:resilience": "node scripts/resilience-test.mjs"
   },
   "engines": {
     "node": ">=20"

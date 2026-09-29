@@ -123,6 +123,29 @@ await check('SQL-ээр шууд унтраахад кэш дуусах хүрт
   return stale.credential_active === true && fresh.credential_active === false;
 });
 
+await check('сан унтарсан үед бүртгэлтэй машин эзнийхээ данс дээр үлдэнэ', async () => {
+  // A fresh process with a 1 ms TTL: every call is past its TTL, so the only
+  // thing between a slow database and the env fallback (the operator's own
+  // merchant) is the last answer this process saw.
+  const { execFileSync } = await import('node:child_process');
+  const script = `
+    import { close } from './src/db.js';
+    import * as owners from './src/owners.js';
+    const first = await owners.resolveMachine(${JSON.stringify(deviceNo)});
+    await close();
+    await new Promise((r) => setTimeout(r, 20)); // past the 1 ms TTL
+    const stale = await owners.resolveMachine(${JSON.stringify(deviceNo)}).catch((e) => ({ threw: e.message }));
+    const unknown = await owners.resolveMachine('NEVER-SEEN').then(() => 'answered', () => 'threw');
+    console.log(JSON.stringify({ first: first?.owner_id, stale: stale?.owner_id ?? stale, unknown, stats: owners.cacheStats().stale }));
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env, OWNER_CACHE_TTL_MS: '1' },
+    encoding: 'utf8',
+  }).trim().split('\n').at(-1));
+  return (out.first === ownerId && out.stale === ownerId && out.unknown === 'threw' && out.stats === 1) || JSON.stringify(out);
+});
+
 await close();
 const passed = results.filter(([ok]) => ok).length;
 for (const [ok, name, extra] of results) console.log(`  ${ok ? '✓' : '✗'} ${name}${extra}`);

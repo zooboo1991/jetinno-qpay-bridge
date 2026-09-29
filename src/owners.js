@@ -30,6 +30,8 @@ const byDevice = new Map();
 // hit rate near zero would say the TTL is shorter than the gap between sales.
 let hits = 0;
 let misses = 0;
+// Answers served past the TTL because the database could not be reached.
+let stale = 0;
 
 export async function resolveMachine(deviceNo) {
   const hit = byDevice.get(deviceNo);
@@ -39,7 +41,20 @@ export async function resolveMachine(deviceNo) {
   }
   misses += 1;
 
-  const row = await store.resolveMachine(deviceNo);
+  let row;
+  try {
+    row = await store.resolveMachine(deviceNo);
+  } catch (err) {
+    // The database is slow or down. A device we have seen registered stays
+    // on its owner's merchant — a minute-old answer routes the money right,
+    // where the caller's env fallback would put an owner's sale into the
+    // operator's account. Only a device never seen here falls through.
+    if (hit?.row) {
+      stale += 1;
+      return hit.row;
+    }
+    throw err;
+  }
   // A miss is cached too. An unregistered device is exactly the case that
   // repeats — a machine nobody has seeded sells all day — and without this
   // every one of those sales pays for the same negative lookup.
@@ -71,9 +86,10 @@ export function forgetAll() {
   byDevice.clear();
   hits = 0;
   misses = 0;
+  stale = 0;
 }
 
 /** For /health: how much is being held, how often it answers, and the TTL. */
 export function cacheStats() {
-  return { entries: byDevice.size, ttlMs: TTL_MS, hits, misses };
+  return { entries: byDevice.size, ttlMs: TTL_MS, hits, misses, stale };
 }

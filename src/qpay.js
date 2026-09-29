@@ -259,6 +259,22 @@ export function clientFor({ username, password, invoiceCode, cacheKey }) {
 }
 
 /**
+ * A client for a credential exactly as it comes out of the seal.
+ *
+ * Two spellings are live in the database: the portal's verify flow seals
+ * `invoiceCode`, the older CLI (register-owner.js) sealed `invoice_code`.
+ * Reading only one of them refused every sale for the other kind of owner.
+ */
+export function clientForSealed(plain, cacheKey) {
+  return clientFor({
+    username: plain?.username,
+    password: plain?.password,
+    invoiceCode: plain?.invoiceCode ?? plain?.invoice_code,
+    cacheKey,
+  });
+}
+
+/**
  * The credential-flow's entry point. Same client, keyed by credential id so a
  * candidate merchant being verified never shares a token cache with the one
  * currently taking that owner's money.
