@@ -125,10 +125,12 @@ await new Promise((r) => smsFake.listen(SMS_PORT, '127.0.0.1', r));
 // ---- boot the bridge -------------------------------------------------------
 const PORT = 3197;
 const key = () => randomBytes(32).toString('base64');
-const bridge = spawn(process.execPath, ['src/server.js'], {
-  env: {
+const BRIDGE_ENV = {
     ...process.env,
     PORT: String(PORT),
+    // The SMS step-up is off by default since 2026-10; these checks cover the
+    // full behaviour with it on. A second bridge below checks it off.
+    QPAY_SMS_STEP_UP: 'on',
     QPAY_MOCK: '1',
     JETINNO_USERNAME: 'testname',
     JETINNO_APIKEY: 'DBRW17YE7FHKR72T',
@@ -145,9 +147,8 @@ const bridge = spawn(process.execPath, ['src/server.js'], {
     QPAY_BASE_URL: `http://127.0.0.1:${QPAY_PORT}`,
     SMS_API_URL: `http://127.0.0.1:${SMS_PORT}/send`,
     SMS_API_KEY: 'test-sms-key',
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+};
+const bridge = spawn(process.execPath, ['src/server.js'], { env: BRIDGE_ENV, stdio: ['ignore', 'pipe', 'pipe'] });
 let log = '';
 bridge.stdout.on('data', (d) => (log += d));
 bridge.stderr.on('data', (d) => (log += d));
@@ -540,6 +541,45 @@ await check('оператор биш хүн QPay тохируулж ЧАДАХГ
   const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OWNER), body: creds() });
   return r.status === 401 && (await credOf(ownerId)).status === 'pending';
 });
+
+// ---- the same routes with the SMS step-up off (the default) ------------------
+const PORT_OFF = 3198;
+const bridgeOff = spawn(process.execPath, ['src/server.js'], {
+  env: { ...BRIDGE_ENV, PORT: String(PORT_OFF), RENDER_EXTERNAL_URL: `http://localhost:${PORT_OFF}`, QPAY_SMS_STEP_UP: undefined },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+let logOff = '';
+bridgeOff.stdout.on('data', (d) => (logOff += d));
+bridgeOff.stderr.on('data', (d) => (logOff += d));
+for (let i = 0; i < 80 && !logOff.includes('credentials api'); i++) await sleep(250);
+const callOff = async (path, { token, body } = {}) => {
+  const res = await fetch(`http://localhost:${PORT_OFF}${path}`, {
+    method: body ? 'POST' : 'GET',
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { status: res.status, json };
+};
+
+await check('SMS step-up унтраалттай (анхдагч): портал SMS асуухгүй — required:false, ageSeconds 0', async () => {
+  const r = await callOff('/owner/v1/step-up', { token: await mint(OPERATOR, { otpAgo: 86400 }) });
+  return (r.status === 200 && r.json?.required === false && r.json?.ageSeconds === 0) || JSON.stringify(r.json);
+});
+
+await check('SMS step-up унтраалттай: хуучин SMS кодтой оператор QPay шалгалт руу шууд орно (REAUTH биш)', async () => {
+  // A wrong password: it reaches QPay and is refused there, so nothing is written.
+  const r = await callOff(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR, { otpAgo: 86400 }), body: creds({ password: 'wrong-pass' }) });
+  return (r.json?.code === 'AUTH_FAILED' && (await credOf(ownerId)).status === 'pending') || JSON.stringify(r.json);
+});
+
+await check('SMS step-up унтраалттай ч нэвтрээгүй хүн QPay тохируулж чадахгүй', async () => {
+  const r = await callOff(`/admin/v1/owners/${ownerId}/credentials`, { body: creds() });
+  return r.status === 401 || JSON.stringify(r);
+});
+bridgeOff.kill('SIGTERM');
 
 await check('операторын SMS код 10 минутаас хуучин бол дахин баталгаажуулахыг шаардана', async () => {
   const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR, { otpAgo: 3600 }), body: creds() });

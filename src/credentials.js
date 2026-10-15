@@ -103,6 +103,11 @@ const VERIFY_TTL_MINUTES = Number(process.env.CRED_VERIFY_TTL_MINUTES ?? 20);
 //   session) that is not present at an installation.
 //   Later CHANGES happen alone, months later, from memory. That is the
 //   stolen-session case, and it gets a fresh OTP.
+// A fresh SMS code before a QPay credential is written ("step-up"). Off by
+// default since 2026-10: SMS delivery proved unreliable and blocked owners and
+// the operator from connecting QPay at all. Being signed in is still required.
+// QPAY_SMS_STEP_UP=on restores the check everywhere it applies.
+const SMS_STEP_UP = process.env.QPAY_SMS_STEP_UP === 'on';
 const STEP_UP_FIRST_SECONDS = Number(process.env.CRED_STEP_UP_FIRST_SECONDS ?? 3600);
 const STEP_UP_CHANGE_SECONDS = Number(process.env.CRED_STEP_UP_CHANGE_SECONDS ?? 600);
 
@@ -466,8 +471,10 @@ const STEP_UP_RECORD_WINDOW_SECONDS = 300;
 router.get('/step-up', async (req, res) => {
   const actor = await authenticate(req);
   if (!actor) return reply(res, 401, 'FORBIDDEN');
-  const age = await store.stepUpAgeSeconds(actor.userId);
+  // With the SMS check off, the portal is told so and asks for no code.
+  const age = SMS_STEP_UP ? await store.stepUpAgeSeconds(actor.userId) : 0;
   return reply(res, 200, 'OK', {
+    required: SMS_STEP_UP,
     ageSeconds: age,
     firstEntryMaxSeconds: STEP_UP_FIRST_SECONDS,
     changeMaxSeconds: STEP_UP_CHANGE_SECONDS,
@@ -555,7 +562,7 @@ router.post('/credentials/verify', async (req, res) => {
     // Step-up. First entry rides the redemption OTP; a change needs a fresh one.
     const isFirstEntry = slot.out_status === 'pending';
     const maxAge = isFirstEntry ? STEP_UP_FIRST_SECONDS : STEP_UP_CHANGE_SECONDS;
-    const age = await store.stepUpAgeSeconds(actor.userId);
+    const age = SMS_STEP_UP ? await store.stepUpAgeSeconds(actor.userId) : 0;
     if (age > maxAge) {
       // Not an error — the expected response for a returning owner. The portal
       // sends an OTP and resubmits, and the UI presents it as a confirmation
@@ -837,7 +844,7 @@ router.post('/credentials/:credentialId/active', async (req, res) => {
   // Turning a credential back ON is a money-direction change, so it needs the
   // same freshness as one. Turning it OFF must never be gated: a person who
   // believes their password just leaked has to be able to stop it now.
-  if (body.active) {
+  if (body.active && SMS_STEP_UP) {
     const age = await store.stepUpAgeSeconds(actor.userId);
     if (age > STEP_UP_CHANGE_SECONDS) return reply(res, 401, 'REAUTH_REQUIRED');
   }
@@ -920,7 +927,9 @@ operatorRouter.post('/owners/:ownerId/credentials', async (req, res) => {
     actorUserId = actor.userId;
 
     const now = Math.floor(Date.now() / 1000);
-    if (!actor.otpAt || now - actor.otpAt > OPERATOR_STEP_UP_SECONDS) return reply(res, 401, 'REAUTH_REQUIRED');
+    if (SMS_STEP_UP && (!actor.otpAt || now - actor.otpAt > OPERATOR_STEP_UP_SECONDS)) {
+      return reply(res, 401, 'REAUTH_REQUIRED');
+    }
 
     if (!UUID.test(req.params.ownerId)) return reply(res, 400, 'INVALID_INPUT', { field: 'ownerId' });
     ownerId = req.params.ownerId;
