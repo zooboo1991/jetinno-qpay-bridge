@@ -1,6 +1,7 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import * as store from './store.js';
+import { forgetDevice } from './owners.js';
 import { verifyAccessToken } from './owner-auth.js';
 import { sendSms, smsConfigured, localNumber } from './sms.js';
 
@@ -21,8 +22,8 @@ import { sendSms, smsConfigured, localNumber } from './sms.js';
  * router would still refuse.
  *
  * Almost read-only. The writes are onboarding and nothing else — register a
- * business with an empty credential slot, issue its invite, correct its
- * invoice code — and none of them can touch a sealed credential or make
+ * business with an empty credential slot, add a machine to it, issue its
+ * invite, correct its invoice code — and none of them can touch a sealed credential or make
  * anybody a member. The owner still has to present the invite from the right
  * phone and type their own QPay password; the operator can hand over the key
  * but cannot turn it.
@@ -248,6 +249,23 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
       };
     }
     throw new Error('invite reference collided three times');
+  }));
+
+  /** A further machine for an existing business, on that business's QPay. */
+  router.post('/owners/:ownerId/machines', json, handler('add machine', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId) return { status: 'not_found', machineId: null };
+    const deviceNo = str(req.body?.deviceNo).trim();
+    const r = await store.operatorAddMachine(req.operator.userId, {
+      ownerId,
+      deviceNo,
+      location: str(req.body?.location),
+    });
+    // A sale from this device in the last minute was cached as "unregistered"
+    // (operator's merchant). Sibling instances drop it within owners.js's TTL.
+    if (r.out_status === 'ok') forgetDevice(deviceNo);
+    log('admin add machine', r.out_status, ownerId);
+    return { status: r.out_status, machineId: r.out_machine_id ?? null };
   }));
 
   router.post('/owners/:ownerId/invoice-code', json, handler('invoice-code', async (req) => {

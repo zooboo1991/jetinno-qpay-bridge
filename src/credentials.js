@@ -675,9 +675,6 @@ router.post('/credentials/verify', async (req, res) => {
       // The candidate merchant is real and reachable, so its probe invoice
       // exists and must not be orphaned.
       await cancelVerifyInvoice({ credentialId, ownerId, sealedBlob: v.sealed, invoiceId: v.invoiceId });
-      if (begun.out_status === 'duplicate_other_owner') {
-        alerts.pageOperator('duplicate merchant across owners', { ownerId, credentialId });
-      }
       safeLog({ event: 'verify_rejected', ownerId, credentialId, actorUserId, outcome: begun.out_status });
       await pad();
       return reply(res, 409, begun.out_status.toUpperCase());
@@ -974,7 +971,6 @@ operatorRouter.post('/owners/:ownerId/credentials', async (req, res) => {
       usernameHint: v.usernameHint, invoiceCodeHint: v.invoiceCodeHint,
     });
     if (status !== 'ok') {
-      if (status === 'duplicate_other_owner') alerts.pageOperator('duplicate merchant across owners', { ownerId, credentialId });
       safeLog({ event: 'operator_configure_rejected', ownerId, credentialId, actorUserId, outcome: status });
       return reply(res, 409, String(status).toUpperCase());
     }

@@ -680,6 +680,17 @@ export async function operatorProvisionOwner(actorUserId, {
   return rows[0] ?? { out_status: 'error' };
 }
 
+/** A further machine for an existing business, on that business's QPay (016). */
+export async function operatorAddMachine(actorUserId, { ownerId, deviceNo, location }) {
+  const { rows } = await query(`select * from app.operator_add_machine($1,$2,$3,$4)`, [
+    actorUserId,
+    ownerId,
+    deviceNo,
+    location ?? null,
+  ]);
+  return rows[0] ?? { out_status: 'error' };
+}
+
 /** Takes the token's DIGEST. The raw token never reaches Postgres. */
 export async function operatorCreateInvite(actorUserId, { ownerId, tokenHash, reference, invitedPhone, role }) {
   const { rows } = await query(

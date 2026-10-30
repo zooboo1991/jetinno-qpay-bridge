@@ -626,13 +626,103 @@ await check('тохируулсны дараа машин эзэмшигчийн
   return m?.credential_status === 'active' && m.credential_active === true;
 });
 
-await check('нэг QPay дансыг өөр харилцагчид давхар тохируулахгүй', async () => {
+// ---- one QPay merchant for many businesses and machines (migration 016) -------
+let sharedOwner;
+await check('нэг QPay дансыг өөр харилцагчид давхар тохируулж болно, аудитад тэмдэглэгдэнэ', async () => {
   const other = await call('/admin/v1/owners', {
     token: op,
     body: { ...newOwner, name: 'Өөр ХХК', contactPhone: '99887755', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
   });
-  const r = await call(`/admin/v1/owners/${other.json.ownerId}/credentials`, { token: await mint(OPERATOR), body: creds() });
-  return (r.status === 409 && r.json?.code === 'DUPLICATE_OTHER_OWNER') || JSON.stringify(r.json);
+  sharedOwner = other.json?.ownerId;
+  const r = await call(`/admin/v1/owners/${sharedOwner}/credentials`, { token: await mint(OPERATOR), body: creds() });
+  const a = await credOf(ownerId);
+  const b = await credOf(sharedOwner);
+  const audit = await query(
+    `select detail->>'shared_with_owners' as shared from public.credential_audit
+      where owner_id = $1 and action = 'operator_configured' order by at desc limit 1`,
+    [sharedOwner]
+  );
+  return (
+    r.status === 200 && a.status === 'active' && a.is_active === true &&
+    b.status === 'active' && b.is_active === true && audit.rows[0]?.shared === '1'
+  ) || JSON.stringify({ r: r.json, a: a?.status, b: b?.status, audit: audit.rows[0] });
+});
+
+await check('хоёр харилцагчийн машин тус тусын слотоор, нэг QPay дансаар зарна', async () => {
+  const { resolveMachine, forgetAll } = await import('../src/owners.js');
+  forgetAll();
+  const { rows } = await query(
+    `select device_no from public.machines where owner_id = any($1::uuid[])`, [[ownerId, sharedOwner]]
+  );
+  const ms = await Promise.all(rows.map((x) => resolveMachine(x.device_no)));
+  return (
+    ms.length === 2 && ms.every((m) => m?.credential_active === true) &&
+    new Set(ms.map((m) => m.owner_id)).size === 2 &&
+    new Set(ms.map((m) => m.qpay_credential_id)).size === 2
+  ) || JSON.stringify(ms.map((m) => m && { owner: m.owner_id, active: m.credential_active }));
+});
+
+await check('нэг харилцагч дээр ижил QPay-г дахин оруулах нь хэвийн', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/credentials`, { token: await mint(OPERATOR), body: creds() });
+  return (r.status === 200 && (await credOf(ownerId)).is_active === true) || JSON.stringify(r.json);
+});
+
+await check('харилцагч өөрөө ч өөр компанитай ижил QPay дансаа холбож болно', async () => {
+  const r = await verifyAs({ username: 'shinekofe', password: 'Merchant-Pass-9', invoiceCode: 'SHINE_INV_01' });
+  const fp = async (where, id) =>
+    (await query(`select status, is_active, fingerprint from public.qpay_credentials where ${where} = $1`, [id])).rows[0];
+  const mine = await fp('id', codelessCred);
+  const theirs = await fp('owner_id', ownerId);
+  const audit = await query(
+    `select detail->>'shared_with_owners' as shared from public.credential_audit
+      where credential_id = $1 and action = 'verify_started' order by at desc limit 1`,
+    [codelessCred]
+  );
+  return (
+    r.status === 200 && r.json?.activated === true && mine.status === 'active' && mine.is_active === true &&
+    mine.fingerprint === theirs.fingerprint && audit.rows[0]?.shared === '2'
+  ) || JSON.stringify({ r: r.json, status: mine?.status, audit: audit.rows[0] });
+});
+
+await check('оператор биш хүн машин нэмж ЧАДАХГҮЙ', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/machines`, { token: await mint(OWNER), body: { deviceNo: 'D-EXTRA-0' } });
+  const n = (await query(`select count(*)::int n from public.machines where device_no = 'D-EXTRA-0'`)).rows[0].n;
+  return r.status === 401 && n === 0;
+});
+
+const EXTRA = `D${Math.floor(Math.random() * 1e9)}`;
+await check('одоо байгаа харилцагчид машин нэмнэ — бусад машинтай нь ижил QPay слотоор', async () => {
+  const r = await call(`/admin/v1/owners/${ownerId}/machines`, { token: op, body: { deviceNo: ` ${EXTRA} `, location: 'БЗД' } });
+  const { rows } = await query(
+    `select m.device_no, m.location, m.status, m.owner_id,
+            m.qpay_credential_id = (select qpay_credential_id from public.machines where device_no = $2) as same_slot
+       from public.machines m where m.id = $1`,
+    [r.json?.machineId, DEVICE]
+  );
+  const x = rows[0];
+  return (
+    r.json?.status === 'ok' && x?.device_no === EXTRA && x.location === 'БЗД' &&
+    x.status === 'active' && x.owner_id === ownerId && x.same_slot === true
+  ) || JSON.stringify({ r: r.json, x });
+});
+
+await check('нэмсэн машин шууд харилцагчийн QPay-гаар зарна', async () => {
+  const { resolveMachine, forgetAll } = await import('../src/owners.js');
+  forgetAll();
+  const m = await resolveMachine(EXTRA);
+  return (m?.owner_id === ownerId && m.credential_active === true) || JSON.stringify(m);
+});
+
+await check('машин нэмэх: давхар дугаар, буруу дугаар, байхгүй харилцагч татгалзана', async () => {
+  const fresh = () => `D${Math.floor(Math.random() * 1e9)}`;
+  const taken = await call(`/admin/v1/owners/${sharedOwner}/machines`, { token: op, body: { deviceNo: EXTRA } });
+  const bad = await call(`/admin/v1/owners/${ownerId}/machines`, { token: op, body: { deviceNo: 'x!' } });
+  const none = await call(`/admin/v1/owners/${randomUUID()}/machines`, { token: op, body: { deviceNo: fresh() } });
+  const junk = await call('/admin/v1/owners/not-a-uuid/machines', { token: op, body: { deviceNo: fresh() } });
+  return (
+    taken.json?.status === 'device_taken' && bad.json?.status === 'invalid_device' &&
+    none.json?.status === 'not_found' && junk.json?.status === 'not_found'
+  ) || JSON.stringify([taken.json, bad.json, none.json, junk.json]);
 });
 
 // ---- machine faults imported from Jetinno's SaaS (migration 015) -----------------
