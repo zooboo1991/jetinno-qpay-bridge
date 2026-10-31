@@ -797,3 +797,170 @@ export async function operatorSetCredential(actorUserId, { ownerId, credentialId
 export async function touchMachineSeen(deviceNo) {
   await query(`select app.touch_machine_seen($1)`, [deviceNo]);
 }
+
+// ---------------------------------------------------------------------------
+// Phone notifications (migration 017): Web Push subscriptions, the once-only
+// sale push, and the operator's announcements to owners.
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per browser. A device that signs in as somebody else takes the row
+ * with it: the endpoint is the browser's, and it now belongs to whoever is
+ * signed in on it.
+ */
+export async function savePushSubscription(userId, { endpoint, p256dh, auth, notifySales }) {
+  return one(
+    `insert into public.push_subscriptions (user_id, endpoint, p256dh, auth, notify_sales)
+     values ($1, $2, $3, $4, $5)
+     on conflict (endpoint) do update
+       set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+           notify_sales = excluded.notify_sales
+     returning notify_sales`,
+    [userId, endpoint, p256dh, auth, notifySales]
+  );
+}
+
+export async function deletePushSubscription(userId, endpoint) {
+  const { rowCount } = await query(
+    `delete from public.push_subscriptions where user_id = $1 and endpoint = $2`,
+    [userId, endpoint]
+  );
+  return rowCount > 0;
+}
+
+/** null when this browser is not subscribed for this person. */
+export const pushSubscriptionState = (userId, endpoint) =>
+  one(`select notify_sales from public.push_subscriptions where user_id = $1 and endpoint = $2`, [userId, endpoint]);
+
+export const setPushSales = (userId, endpoint, on) =>
+  one(
+    `update public.push_subscriptions set notify_sales = $3
+      where user_id = $1 and endpoint = $2 returning notify_sales`,
+    [userId, endpoint, on]
+  );
+
+const SUB_COLUMNS = 's.id, s.endpoint, s.p256dh, s.auth';
+
+/** Everyone who runs this business and wants to hear about its sales. */
+export async function saleSubscriptions(ownerId) {
+  const { rows } = await query(
+    `select distinct ${SUB_COLUMNS}
+       from public.push_subscriptions s
+       join public.owner_members m on m.user_id = s.user_id
+      where m.owner_id = $1 and s.notify_sales`,
+    [ownerId]
+  );
+  return rows;
+}
+
+/** Every device of everyone who runs one of these businesses. */
+export async function ownerSubscriptions(ownerIds) {
+  const { rows } = await query(
+    `select distinct ${SUB_COLUMNS}
+       from public.push_subscriptions s
+       join public.owner_members m on m.user_id = s.user_id
+      where m.owner_id = any ($1::uuid[])`,
+    [ownerIds]
+  );
+  return rows;
+}
+
+export async function userSubscriptions(userId) {
+  const { rows } = await query(`select ${SUB_COLUMNS} from public.push_subscriptions s where s.user_id = $1`, [userId]);
+  return rows;
+}
+
+/** Stamps the devices that took a push; drops the ones the push service has forgotten. */
+export async function pushDelivered({ okIds = [], goneIds = [] }) {
+  if (okIds.length) {
+    await query(`update public.push_subscriptions set last_ok_at = now() where id = any ($1::bigint[])`, [okIds]);
+  }
+  if (goneIds.length) {
+    await query(`delete from public.push_subscriptions where id = any ($1::bigint[])`, [goneIds]);
+  }
+}
+
+/**
+ * Claims the sale push for one confirmed order. The settle path can run more
+ * than once for a payment; only the call that sets sale_push_at gets a row.
+ */
+export const claimSalePush = (orderId) =>
+  one(
+    `update public.orders o
+        set sale_push_at = now()
+      where o.id = $1 and o.sale_push_at is null and o.payment_confirmed_at is not null
+      returning o.owner_id, coalesce(o.paid_amount_mnt, o.amount_mnt) as amount_mnt,
+                o.device_no, o.product_name,
+                (select coalesce(m.location, m.label) from public.machines m where m.id = o.machine_id) as place`,
+    [orderId]
+  );
+
+export async function operatorCreateNotification(actorUserId, { title, body, link, target, channel, ownerIds }) {
+  const { rows } = await query(
+    `select * from app.operator_create_notification($1, $2, $3, $4, $5, $6, $7::uuid[])`,
+    [actorUserId, title, body, link ?? null, target, channel, ownerIds ?? []]
+  );
+  return rows[0] ?? { out_status: 'error' };
+}
+
+export async function operatorNotifications(actorUserId, limit) {
+  const { rows } = await query(`select * from app.operator_notifications($1, $2)`, [actorUserId, limit ?? 50]);
+  return rows;
+}
+
+/** Delivery counts, written back after the sends finish. */
+export async function recordNotificationDelivery(id, { pushSent = 0, pushFailed = 0, smsSent = 0, smsFailed = 0 }) {
+  await query(
+    `update public.notifications
+        set push_sent = push_sent + $2, push_failed = push_failed + $3,
+            sms_sent = sms_sent + $4, sms_failed = sms_failed + $5
+      where id = $1`,
+    [id, pushSent, pushFailed, smsSent, smsFailed]
+  );
+}
+
+/** The contact phones on the paperwork of these businesses, each once. */
+export async function ownerContactPhones(ownerIds) {
+  const { rows } = await query(
+    `select distinct o.contact_phone from public.owners o
+      where o.id = any ($1::uuid[]) and o.contact_phone is not null`,
+    [ownerIds]
+  );
+  return rows.map((r) => r.contact_phone);
+}
+
+/** An owner's inbox: announcements meant for the app, newest first. */
+export async function ownerNotifications(ownerId, userId, limit = 50) {
+  const { rows } = await query(
+    `select n.id, n.title, n.body, n.link, n.created_at,
+            n.created_at > coalesce(s.seen_at, '-infinity'::timestamptz) as unread
+       from public.notifications n
+       join public.notification_owners x on x.notification_id = n.id and x.owner_id = $1
+       left join public.notification_seen s on s.user_id = $2 and s.owner_id = $1
+      where n.channel in ('app', 'both')
+      order by n.created_at desc
+      limit $3`,
+    [ownerId, userId, Math.min(Math.max(Number(limit) || 50, 1), 200)]
+  );
+  return rows;
+}
+
+export async function ownerUnreadNotifications(ownerId, userId) {
+  const { rows } = await query(
+    `select count(*)::int as n
+       from public.notifications n
+       join public.notification_owners x on x.notification_id = n.id and x.owner_id = $1
+       left join public.notification_seen s on s.user_id = $2 and s.owner_id = $1
+      where n.channel in ('app', 'both') and n.created_at > coalesce(s.seen_at, '-infinity'::timestamptz)`,
+    [ownerId, userId]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+export async function markNotificationsSeen(ownerId, userId) {
+  await query(
+    `insert into public.notification_seen (user_id, owner_id, seen_at) values ($1, $2, now())
+     on conflict (user_id, owner_id) do update set seen_at = now()`,
+    [userId, ownerId]
+  );
+}

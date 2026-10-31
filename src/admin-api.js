@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import * as store from './store.js';
 import { forgetDevice } from './owners.js';
+import { pushToOwners } from './push.js';
 import { verifyAccessToken } from './owner-auth.js';
 import { sendSms, smsConfigured, localNumber } from './sms.js';
 
@@ -250,6 +251,64 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     }
     throw new Error('invite reference collided three times');
   }));
+
+  // -------------------------------------------------------------------------
+  // Announcements to owners (migration 017). Recorded first, then delivered
+  // off the request: an SMS to every business, one at a time, outlasts the
+  // portal's patience, and the history shows the counts as they land.
+  // -------------------------------------------------------------------------
+  const announcementJson = express.json({ limit: '64kb', type: 'application/json' });
+  const CHANNELS = new Set(['app', 'sms', 'both']);
+  // SMS goes out in Latin (sms.js) and is billed per segment.
+  const SMS_MAX = 300;
+
+  async function deliverAnnouncement(id, { title, body, link, channel }, ownerIds) {
+    try {
+      if (channel !== 'sms') {
+        const p = await pushToOwners(ownerIds, { title, body, url: link || '/notifications', tag: `n-${id}` }, log);
+        await store.recordNotificationDelivery(id, { pushSent: p.sent, pushFailed: p.failed });
+      }
+      if (channel !== 'app') {
+        const text = `${title}. ${body}`.slice(0, SMS_MAX);
+        let sent = 0;
+        let failed = 0;
+        // One at a time: these gateways throttle bursts from one key.
+        for (const phone of await store.ownerContactPhones(ownerIds)) {
+          const sms = await sendSms(phone, text);
+          if (sms.ok) sent += 1;
+          else failed += 1;
+          await store
+            .recordSmsSend(localNumber(phone), 'announcement', sms.ok, sms.status ?? null,
+              sms.ok ? null : String(sms.error ?? '').slice(0, 200), String(sms.reply ?? sms.error ?? '').slice(0, 200))
+            .catch(() => {});
+        }
+        await store.recordNotificationDelivery(id, { smsSent: sent, smsFailed: failed });
+      }
+    } catch (err) {
+      log('announcement delivery failed', id, err.message.split('\n')[0]);
+    }
+  }
+
+  router.post('/notifications', announcementJson, handler('notification', async (req) => {
+    const b = req.body ?? {};
+    const input = {
+      title: str(b.title).trim(),
+      body: str(b.body).trim(),
+      link: str(b.link).trim(),
+      target: b.target === 'owners' ? 'owners' : 'all',
+      channel: CHANNELS.has(b.channel) ? b.channel : 'app',
+      ownerIds: Array.isArray(b.ownerIds) ? b.ownerIds.map(uuidOrNull).filter(Boolean).slice(0, 1000) : [],
+    };
+    const r = await store.operatorCreateNotification(req.operator.userId, input);
+    log('admin notification', r.out_status, r.out_owner_ids?.length ?? 0);
+    if (r.out_status !== 'ok') return { status: r.out_status };
+    deliverAnnouncement(r.out_id, input, r.out_owner_ids);
+    return { status: 'ok', id: r.out_id, recipients: r.out_owner_ids.length };
+  }));
+
+  router.get('/notifications', handler('notifications', async (req) => ({
+    notifications: await store.operatorNotifications(req.operator.userId, 50),
+  })));
 
   /** A further machine for an existing business, on that business's QPay. */
   router.post('/owners/:ownerId/machines', json, handler('add machine', async (req) => {

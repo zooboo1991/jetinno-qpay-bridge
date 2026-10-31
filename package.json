@@ -20,6 +20,7 @@
     "preflight": "node --env-file=.env scripts/preflight.mjs",
     "test:operator": "bash scripts/operator-test.sh",
     "test:onboarding": "bash scripts/onboarding-test.sh",
+    "test:notify": "bash scripts/notify-test.sh",
     "test:resilience": "node scripts/resilience-test.mjs"
   },
   "engines": {
@@ -28,7 +29,8 @@
   "dependencies": {
     "express": "^4.21.2",
     "jose": "^6.2.11",
-    "pg": "^8.23.0"
+    "pg": "^8.23.0",
+    "web-push": "^3.6.7"
   },
   "overrides": {
     "qs": "^6.16.0"

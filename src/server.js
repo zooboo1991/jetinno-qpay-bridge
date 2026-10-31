@@ -8,6 +8,7 @@ import { ownerApi, authConfigured } from './owner-api.js';
 import { adminApi } from './admin-api.js';
 import * as owners from './owners.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
+import { pushConfigured, pushSale } from './push.js';
 import { open, credentialAad } from './crypto.js';
 import { timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 
@@ -632,6 +633,10 @@ async function settle(orderNo) {
           paidAmountMnt: order.paidAmount ?? null,
         });
         if (!confirmed) return await store.releaseSettle(id, 'confirm declined (amount/state mismatch)');
+        // The money is confirmed: tell the owner's phone. Not awaited — the
+        // settle mirror does not wait on a push service, and pushSale claims
+        // the order in SQL so a second settle path cannot send it twice.
+        pushSale(id, log);
         if (!(await store.markNotifySent(id))) return await store.releaseSettle(id, 'notify-sent declined');
         if (!(await store.finishSettle(id))) return await store.releaseSettle(id, 'finish declined');
       } catch (err) {
@@ -880,6 +885,7 @@ app.get('/health', (req, res) =>
     // A hit rate near zero says the TTL is shorter than the gap between
     // sales, i.e. the cache is costing a lookup and buying nothing.
     ownerCache: DUAL_WRITE ? owners.cacheStats() : null,
+    push: pushConfigured(),
     publicUrl: PUBLIC_URL,
     orders: orders.size,
   })

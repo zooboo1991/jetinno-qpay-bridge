@@ -1,6 +1,7 @@
 import express from 'express';
 import * as store from './store.js';
 import { requireOwner, resolveOwnerId, authConfigured } from './owner-auth.js';
+import { endpointAllowed, publicKey, pushConfigured, pushToUser } from './push.js';
 
 /**
  * The owner portal's read API.
@@ -150,6 +151,90 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   router.get('/problems', ...read('problems', async (ownerId) => ({
     problems: await store.ownerProblems(ownerId),
   })));
+
+  // -------------------------------------------------------------------------
+  // Phone notifications (migration 017). A subscription is the person's, so
+  // these take the user from the token; the inbox is a business's, so it
+  // takes an owner id checked against membership like every read above.
+  // -------------------------------------------------------------------------
+  const json = express.json({ limit: '4kb', type: 'application/json' });
+  const str = (v) => (typeof v === 'string' ? v : '');
+
+  /** Answers what fn returns, unless fn already answered (a 4xx). */
+  const act = (name, fn) => [auth, json, async (req, res) => {
+    try {
+      const out = await fn(req, res);
+      if (out !== undefined && !res.headersSent) res.json(out);
+    } catch (err) {
+      log(`owner ${name} failed`, err.message.split('\n')[0]);
+      if (!res.headersSent) res.status(500).json({ error: 'SYSTEM_ERROR' });
+    }
+  }];
+
+  /** PushSubscription.toJSON() from the browser, checked before it is stored. */
+  const readSubscription = (b) => {
+    const endpoint = str(b?.endpoint);
+    const p256dh = str(b?.keys?.p256dh);
+    const key = str(b?.keys?.auth);
+    if (endpoint.length > 1000 || !endpointAllowed(endpoint)) return null;
+    if (!/^[A-Za-z0-9_-]{20,200}={0,2}$/.test(p256dh) || !/^[A-Za-z0-9_-]{8,100}={0,2}$/.test(key)) return null;
+    return { endpoint, p256dh, auth: key };
+  };
+
+  /** Not a secret: the portal subscribes with it. null when push is off. */
+  router.get('/push/key', (req, res) => res.json({ publicKey: publicKey() }));
+
+  router.post('/push/subscribe', ...act('push subscribe', async (req, res) => {
+    const sub = readSubscription(req.body);
+    if (!sub) return void res.status(400).json({ error: 'INVALID_SUBSCRIPTION' });
+    const row = await store.savePushSubscription(req.owner.userId, { ...sub, notifySales: req.body?.notifySales !== false });
+    return { subscribed: true, notifySales: row?.notify_sales ?? true };
+  }));
+
+  router.post('/push/unsubscribe', ...act('push unsubscribe', async (req) => {
+    await store.deletePushSubscription(req.owner.userId, str(req.body?.endpoint));
+    return { subscribed: false, notifySales: false };
+  }));
+
+  // POST, not GET: the endpoint is a capability and has no business in a URL.
+  router.post('/push/state', ...act('push state', async (req) => {
+    const row = await store.pushSubscriptionState(req.owner.userId, str(req.body?.endpoint));
+    return { subscribed: Boolean(row), notifySales: row?.notify_sales ?? false };
+  }));
+
+  router.post('/push/sales', ...act('push sales', async (req) => {
+    const row = await store.setPushSales(req.owner.userId, str(req.body?.endpoint), req.body?.on === true);
+    return { subscribed: Boolean(row), notifySales: row?.notify_sales ?? false };
+  }));
+
+  router.post('/push/test', ...act('push test', async (req) => {
+    if (!pushConfigured()) return { configured: false, sent: 0, failed: 0 };
+    const r = await pushToUser(
+      req.owner.userId,
+      { title: 'Coffeine', body: 'Мэдэгдэл ажиллаж байна. Орлого орох бүрт ингэж мэдэгдэнэ.', url: '/settings', tag: 'test' },
+      log
+    );
+    return { configured: true, ...r };
+  }));
+
+  router.get('/notifications', ...act('notifications', async (req, res) => {
+    const ownerId = resolveOwnerId(req, res);
+    if (!ownerId) return undefined;
+    return { notifications: await store.ownerNotifications(ownerId, req.owner.userId, req.query.limit) };
+  }));
+
+  router.get('/notifications/unread', ...act('notifications unread', async (req, res) => {
+    const ownerId = resolveOwnerId(req, res);
+    if (!ownerId) return undefined;
+    return { unread: await store.ownerUnreadNotifications(ownerId, req.owner.userId) };
+  }));
+
+  router.post('/notifications/seen', ...act('notifications seen', async (req, res) => {
+    const ownerId = resolveOwnerId(req, res);
+    if (!ownerId) return undefined;
+    await store.markNotificationsSeen(ownerId, req.owner.userId);
+    return { ok: true };
+  }));
 
   /** Who am I, and which businesses can I switch between. */
   router.get('/me', auth, async (req, res) => {
