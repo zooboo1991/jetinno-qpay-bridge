@@ -107,8 +107,13 @@ const machine = createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
   req.on('end', () => {
-    const orderNo = JSON.parse(body)?.data?.orderNo;
-    notifies.push(orderNo);
+    const orderNo = JSON.parse(body || '{}')?.data?.orderNo;
+    if (req.url !== '/notify-moved') notifies.push(orderNo);
+    if (req.url === '/notify-moved') {
+      res.statusCode = 307;
+      res.setHeader('location', '/notify');
+      return res.end();
+    }
     const b = behaviour.get(orderNo) ?? 'ok';
     if (b !== 'ok') behaviour.delete(orderNo);
     if (b === 'hang') return; // no answer: the bridge times out
@@ -267,6 +272,36 @@ await check('grace хугацаа өнгөрмөгц sweep машинд дахи
   await query(`update public.orders set notify_sent_at = now() - interval '1 hour' where order_no = 'S-HANG'`);
   const ok = await until(async () => (await row('S-HANG')).status === 'paid', 6000);
   return (ok && cups('S-HANG') === 2) || { cups: cups('S-HANG'), status: (await row('S-HANG')).status };
+});
+
+// ---- 3b. stale rows: a payment too old to brew goes to a human ---------------------
+await check('15 минутаас хуучин баталгаажсан төлбөрт машинд МЭДЭГДЭХГҮЙ — хүн шийдэх жагсаалтад орно', async () => {
+  const [id, inv] = await sale(DA, 'S-STALE');
+  paid.set(id, 4500);
+  behaviour.set('S-STALE', 'fail');
+  await callback(inv.callbackUrl);
+  // As if the old in-memory settle confirmed it an hour ago and never wrote the rest.
+  await query(`update public.orders set payment_confirmed_at = now() - interval '1 hour' where order_no = 'S-STALE'`);
+  const ok = await until(async () => (await row('S-STALE')).status === 'needs_human', 6000);
+  await sleep(1200);
+  return (ok && cups('S-STALE') === 1) || { status: (await row('S-STALE')).status, cups: cups('S-STALE') };
+});
+
+await check('хуучин QR-ыг цуцлах үед QPay «төлөгдсөн» гэвэл машинд мэдэгдэхгүй — хүнд шилжинэ', async () => {
+  const [id] = await sale(DA, 'S-OLDPAID');
+  paid.set(id, 4500);
+  cancelSaysPaid.add(id);
+  await query(`update public.orders set created_at = now() - interval '2 hours', expires_at = now() - interval '110 minutes' where order_no = 'S-OLDPAID'`);
+  const ok = await until(async () => (await row('S-OLDPAID')).status === 'needs_human', 6000);
+  return (ok && cups('S-OLDPAID') === 0) || { status: (await row('S-OLDPAID')).status, cups: cups('S-OLDPAID') };
+});
+
+await check('notify хаяг 307-оор шилжүүлбэл дагаж, яг нэг аяга гаргана', async () => {
+  const [id, inv] = await sale(DA, 'S-MOVED', { notifyUrl: `http://127.0.0.1:${MACHINE_PORT}/notify-moved` });
+  paid.set(id, 4500);
+  const r = await callback(inv.callbackUrl);
+  const ok = await until(async () => (await row('S-MOVED')).status === 'paid');
+  return (r.status === 200 && ok && cups('S-MOVED') === 1) || { r, cups: cups('S-MOVED') };
 });
 
 // ---- 4. QPay could not be asked ----------------------------------------------------

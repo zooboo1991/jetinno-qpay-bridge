@@ -90,6 +90,18 @@ const NOTIFY_GRACE_S = envInt('NOTIFY_GRACE_SECONDS', 120, { min: 30, max: 3600 
 // Jetinno's own budget for the notify POST. Shorter only for the tests.
 const NOTIFY_TIMEOUT_MS = envInt('NOTIFY_TIMEOUT_MS', 8000, { min: 500, max: 8000 });
 
+/*
+ * How old a payment may be and still make a machine brew. Past this, the
+ * person who paid has long gone and the cup would go to whoever stands at
+ * the machine — or be a second cup for a sale already served by the old
+ * in-memory settle, whose database record never caught up. Such rows go to
+ * a human (needs_human) instead of the machine. This matters most on the
+ * first deploy of the database-driven sweep, which finds every stale row
+ * the previous version left behind.
+ */
+const BREW_WINDOW_MS = envInt('BREW_WINDOW_MS', 15 * 60 * 1000, { min: 60_000, max: 3_600_000 });
+const tooOldToBrew = (at) => !at || Date.now() - new Date(at).getTime() > BREW_WINDOW_MS;
+
 /**
  * (deviceNo, orderNo) -> order.
  *
@@ -653,33 +665,49 @@ async function notifyMachine(order) {
   };
   body.sign = buildSign(flatten(body), SIGNABLE.paymentCallback, APIKEY);
 
-  // A name is resolved and checked here, at the last moment: notifyUrlAllowed
-  // only sees literal addresses, and a public name can point anywhere.
-  if (!MOCK && process.env.ALLOW_PRIVATE_NOTIFY !== '1') {
-    const host = new URL(order.notifyUrl).hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '');
-    if (!isIP(host)) {
-      const addrs = await lookup(host, { all: true }).catch(() => []);
-      if (!addrs.length || addrs.some((a) => privateAddress(a.address))) {
-        throw Object.assign(new Error(`notify host refused: ${host}`), { refused: true });
-      }
-    }
-  }
+  // A name is resolved and checked at the last moment: notifyUrlAllowed only
+  // sees literal addresses, and a public name can point anywhere.
+  const hostAllowed = async (raw) => {
+    if (MOCK || process.env.ALLOW_PRIVATE_NOTIFY === '1') return true;
+    if (!notifyUrlAllowed(raw)) return false;
+    const host = new URL(raw).hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+    if (isIP(host)) return true;
+    const addrs = await lookup(host, { all: true }).catch(() => []);
+    return addrs.length > 0 && !addrs.some((a) => privateAddress(a.address));
+  };
 
   log('notify ->', order.notifyUrl, JSON.stringify(body));
+  // Redirects are followed by hand, at most three, each target checked like
+  // the first — fetch's own following is how a public notify URL reaches an
+  // internal one after every check has passed. 307/308 keep the POST; the
+  // others turn into a GET, exactly as fetch would have done.
+  const signal = AbortSignal.timeout(NOTIFY_TIMEOUT_MS);
+  let url = order.notifyUrl;
+  let method = 'POST';
   let reply;
-  try {
-    reply = await fetch(order.notifyUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      // Never followed: a redirect is how a public notify URL reaches an
-      // internal one after every check above has passed.
-      redirect: 'error',
-      signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
-    });
-  } catch (err) {
-    // Timed out or the connection dropped: the machine may have it.
-    throw new Error(`notify failed: ${firstLine(err)}`);
+  for (let hop = 0; ; hop += 1) {
+    if (!(await hostAllowed(url))) {
+      throw Object.assign(new Error(`notify host refused: ${new URL(url).host}`), { refused: true });
+    }
+    try {
+      reply = await fetch(url, {
+        method,
+        headers: method === 'POST' ? { 'Content-Type': 'application/json' } : {},
+        body: method === 'POST' ? JSON.stringify(body) : undefined,
+        redirect: 'manual',
+        signal,
+      });
+    } catch (err) {
+      // Timed out or the connection dropped: the machine may have it.
+      throw new Error(`notify failed: ${firstLine(err)}`);
+    }
+    const location = reply.headers.get('location');
+    if (reply.status < 300 || reply.status >= 400 || !location) break;
+    await reply.arrayBuffer().catch(() => {}); // free the connection
+    if (hop >= 3) throw Object.assign(new Error('notify: too many redirects'), { refused: true });
+    url = new URL(location, url).toString();
+    if (reply.status !== 307 && reply.status !== 308) method = 'GET';
+    log('notify redirected', reply.status, new URL(url).host);
   }
   const text = await reply.text().catch(() => '');
   log('notify <-', reply.status, text.slice(0, 300));
@@ -925,7 +953,14 @@ async function settle(order, { claimed = null } = {}) {
     }
 
     if (gated) {
-      const confirmed = await store.markPaymentConfirmed(order.pgId, { paymentId: paymentRef, paidAmountMnt: paidAmount });
+      // The database confirms only the invoiced amount. A payment above it
+      // (QPay invoices are fixed, so this should never happen) still brews,
+      // as it always did, and is noted rather than refused.
+      if (paidAmount > order.amountMnt) log('paid more than invoiced', order.orderNo, `${paidAmount} > ${order.amountMnt}`);
+      const confirmed = await store.markPaymentConfirmed(order.pgId, {
+        paymentId: paymentRef,
+        paidAmountMnt: Math.min(paidAmount, order.amountMnt),
+      });
       if (!confirmed) {
         await store.releaseSettle(order.pgId, 'confirm declined (amount/state mismatch)').catch(() => {});
         alerts.pageOperator('paid order refused by the database', { deviceNo: order.deviceNo, orderNo: order.orderNo });
@@ -990,7 +1025,7 @@ function mirrorAfterTheFact(order) {
     try {
       const confirmed = await store.markPaymentConfirmed(id, {
         paymentId: order.paymentRef ?? null,
-        paidAmountMnt: order.paidAmount ?? null,
+        paidAmountMnt: order.paidAmount == null ? null : Math.min(order.paidAmount, order.amountMnt),
       });
       if (!confirmed) return await store.releaseSettle(id, 'confirm declined (amount/state mismatch)');
       pushSale(id, log);
@@ -1416,7 +1451,10 @@ async function sweepMap() {
       // settle's 'paid' re-arms settle for the same order — and the machine
       // brews a second cup for one payment.
       if (result.paid) {
-        if (order.status === 'cancelled') {
+        if (order.status === 'cancelled' && tooOldToBrew(new Date(order.createdAt + ABANDON_AFTER_MS))) {
+          order.status = 'needs_human';
+          alerts.pageOperator('an old QR was paid long after it was shown — check and refund', { deviceNo: order.deviceNo, orderNo: order.orderNo });
+        } else if (order.status === 'cancelled') {
           order.status = 'awaiting_payment';
           log('sweep found payment, settling', order.orderNo);
           await settle(order);
@@ -1453,9 +1491,16 @@ function orderForRow(row) {
 
 async function drainUnnotified() {
   const rows = await store.claimUnnotified({ limit: 20, leaseSeconds: 90, instance: INSTANCE, notifyGraceSeconds: NOTIFY_GRACE_S });
+  let stale = 0;
   for (const row of rows) {
     const order = orderForRow(row);
     try {
+      if (order.status !== 'paid' && tooOldToBrew(row.payment_confirmed_at)) {
+        await store.giveUp(row.id, 'STALE_PAYMENT: confirmed too long ago to brew');
+        order.status = 'needs_human';
+        stale += 1;
+        continue;
+      }
       if (order.status === 'paid') {
         // The notify went through here; only the finish was lost.
         if (!(await store.finishSettle(row.id))) await store.releaseSettle(row.id, 'finish declined');
@@ -1488,6 +1533,10 @@ async function drainUnnotified() {
       await store.releaseSettle(row.id, firstLine(err).slice(0, 200)).catch(() => {});
     }
   }
+  if (stale) {
+    log('sweep: stale paid orders handed to a human', stale);
+    alerts.pageOperator(`${stale} paid order(s) too old to brew — check and refund if needed`, {});
+  }
 }
 
 async function drainAbandoned() {
@@ -1518,6 +1567,14 @@ async function drainAbandoned() {
         }
         if (merchant.client) order.qpay = merchant.client;
         result = await (order.qpay ?? qpay).cancelInvoice(row.qpay_invoice_id);
+      }
+      if (result.paid && tooOldToBrew(new Date(new Date(row.created_at).getTime() + ABANDON_AFTER_MS))) {
+        // Paid, but the QR is long past its life: no machine is waiting for
+        // this order any more.
+        await store.giveUp(row.id, 'PAID_TOO_LATE: invoice paid long after it was shown');
+        order.status = 'needs_human';
+        alerts.pageOperator('an old QR was paid long after it was shown — check and refund', { deviceNo: row.device_no, orderNo: row.order_no });
+        continue;
       }
       if (result.paid) {
         log('sweep found payment, settling', row.order_no);
