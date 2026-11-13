@@ -21,7 +21,10 @@
     "test:operator": "bash scripts/operator-test.sh",
     "test:onboarding": "bash scripts/onboarding-test.sh",
     "test:notify": "bash scripts/notify-test.sh",
-    "test:resilience": "node scripts/resilience-test.mjs"
+    "test:resilience": "node scripts/resilience-test.mjs",
+    "test:settle": "bash scripts/settle-test.sh",
+    "test:qpay": "node scripts/qpay-cache-test.mjs",
+    "test:grants": "bash scripts/grants-test.sh"
   },
   "engines": {
     "node": ">=20"

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * QPay v2 merchant API, one client per merchant credential.
  *
@@ -32,6 +34,25 @@ async function detail(res) {
 }
 
 /**
+ * What of a QPay error body may travel in an Error's message: its error code
+ * and nothing else. The bodies echo the merchant username (a 401) and, on
+ * some refusals, the request — and these messages reach the log ring and the
+ * ingest_errors table. Callers that classify a refusal read the code.
+ */
+export function qpayCode(text) {
+  const raw = String(text ?? '');
+  let code = '';
+  try {
+    const j = JSON.parse(raw);
+    code = String(j?.error ?? j?.code ?? j?.message ?? '');
+  } catch {
+    code = /\b([A-Z][A-Z_]{2,38})\b/.exec(raw)?.[1] ?? '';
+  }
+  code = code.trim().toUpperCase();
+  return /^[A-Z_]{3,34}$/.test(code) ? code : '';
+}
+
+/**
  * Every QPay call is bounded. Node's default socket timeout is measured in
  * minutes, and Jetinno gives the whole request 8 seconds — without a deadline
  * a hung QPay connection blows that budget, and worse, a hung checkPayment
@@ -52,23 +73,33 @@ const TIMEOUT_MS = {
 const SETTLED = new Set(['PAID']);
 
 /**
- * Token cache, keyed per credential.
+ * Token cache, keyed per credential AND per merchant login.
  *
  * QPay forbids fetching a fresh token on every request, so tokens are cached
  * for the life of the process — but a single module-level cache would hand
  * owner B's requests owner A's token the moment a second merchant existed.
- * The key is the credential id (or '__env__' for the operator's own account),
- * so client objects can be constructed freely while the cache stays shared.
+ *
+ * The credential id alone was not enough either: a credential is re-pointed
+ * at another merchant IN PLACE, under the same id, while orders invoiced on
+ * the old merchant are still open and still hold the old client. Both clients
+ * then shared one slot — old-merchant tokens on new invoices, new-merchant
+ * tokens checking old payments. A hash of the login keeps them apart; a
+ * password change alone still shares the slot, as it should.
  */
 const tokenCaches = new Map();
 
-/** Drops a cached token — called when a credential is rotated or revoked. */
+const loginHash = (username) =>
+  createHash('sha256').update(String(username ?? '').trim().toLowerCase(), 'utf8').digest('hex').slice(0, 16);
+
+/** Drops a credential's cached tokens — called when a credential is rotated or revoked. */
 export function evictCredential(cacheKey) {
-  tokenCaches.delete(cacheKey);
+  for (const key of tokenCaches.keys()) {
+    if (key.startsWith(`${cacheKey}:`)) tokenCaches.delete(key);
+  }
 }
 
 function makeClient({ username, password, invoiceCode, cacheKey }) {
-  const key = cacheKey ?? `user:${username}`;
+  const key = `${cacheKey ?? 'user'}:${loginHash(username)}`;
 
   async function accessToken(force = false) {
     const now = Date.now();
@@ -81,7 +112,12 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
       headers: { Authorization: `Basic ${basic}` },
       signal: AbortSignal.timeout(TIMEOUT_MS.token),
     });
-    if (!res.ok) throw new Error(`qpay auth ${res.status}: ${await detail(res)}`);
+    if (!res.ok) {
+      const err = new Error(`qpay auth ${res.status}: ${qpayCode(await detail(res))}`);
+      err.stage = 'auth';
+      err.status = res.status;
+      throw err;
+    }
     const json = await res.json();
 
     // QPay's docs call expires_in a duration in seconds, but real responses
@@ -141,7 +177,7 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
         signal: signal ?? AbortSignal.timeout(TIMEOUT_MS.token),
       });
       if (!res.ok) {
-        const err = new Error(`qpay auth ${res.status}: ${await detail(res)}`);
+        const err = new Error(`qpay auth ${res.status}: ${qpayCode(await detail(res))}`);
         err.stage = 'auth';
         err.status = res.status;
         throw err;
@@ -178,7 +214,12 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
         }),
       }, TIMEOUT_MS.invoice, signal);
       if (!res.ok) {
-        const err = new Error(`qpay invoice ${res.status}: ${await detail(res)}`);
+        const body = await detail(res);
+        const err = new Error(`qpay invoice ${res.status}: ${qpayCode(body)}`);
+        // The body itself rides along out of sight — not enumerable, so no
+        // logger or serializer picks it up — for the one reader that scrubs
+        // it: the credential path's alert to the operator.
+        Object.defineProperty(err, 'qpayBody', { value: body, enumerable: false });
         err.stage = 'invoice';
         err.status = res.status;
         throw err;
@@ -209,7 +250,11 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
           offset: { page_number: 1, page_limit: 100 },
         }),
       }, TIMEOUT_MS.check);
-      if (!res.ok) throw new Error(`qpay check ${res.status}: ${await detail(res)}`);
+      if (!res.ok) {
+        const err = new Error(`qpay check ${res.status}: ${qpayCode(await detail(res))}`);
+        err.status = res.status;
+        throw err;
+      }
 
       const json = await res.json();
       const rows = (json.rows ?? []).map((r) => ({
@@ -243,7 +288,7 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
       const text = await detail(res);
       if (text.includes('INVOICE_ALREADY_CANCELED')) return { cancelled: true };
       if (text.includes('INVOICE_PAID')) return { cancelled: false, paid: true };
-      throw new Error(`qpay cancel ${res.status}: ${text}`);
+      throw new Error(`qpay cancel ${res.status}: ${qpayCode(text)}`);
     },
   };
 }

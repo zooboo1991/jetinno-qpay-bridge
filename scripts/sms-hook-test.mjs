@@ -208,6 +208,32 @@ await check('ирээдүйн цагтай хүсэлт ч 401', async () => {
 });
 
 // ---- who may be texted ---------------------------------------------------
+// 018. A phone CHANGE carries the code for the NEW number while user.phone is
+// still the old one: texting user.phone handed the asker proof of a number
+// they do not hold — an open invite for it, or an operator's console.
+await check('утас солих (new_phone) хүсэлт 403 — код хэнд ч явахгүй', async () => {
+  sent = [];
+  const body = JSON.stringify({ user: { id: userId, phone: MEMBER_PHONE, new_phone: INVITED_PHONE }, sms: { otp: '424242' } });
+  const r = await post(body, sign(body));
+  return (r.status === 403 && sent.length === 0) || `${r.status} sent=${sent.length}`;
+});
+
+await check('new_phone нь ижил дугаар бол (солих биш) хэвийн илгээнэ', async () => {
+  sent = [];
+  // The invitee's number: the member's hourly budget is counted by later checks.
+  const body = JSON.stringify({ user: { id: userId, phone: INVITED_PHONE, new_phone: '' }, sms: { otp: '434343' } });
+  const r = await post(body, sign(body));
+  return (r.status === 200 && sent.length === 1) || `${r.status} sent=${sent.length}`;
+});
+
+await check('8 оронтой (976-гүй) хувилбар дугаар руу код явуулахгүй — alias данс үүсгэхгүй', async () => {
+  sent = [];
+  const local = String(MEMBER_PHONE).replace(/^976/, '');
+  const body = payloadFor(local);
+  const r = await post(body, sign(body));
+  return (r.status === 403 && sent.length === 0) || `${r.status} sent=${sent.length} phone=${local}`;
+});
+
 await check('урилгагүй дугаар 403 — SMS явуулахгүй', async () => {
   sent = [];
   const body = payloadFor(STRANGER_PHONE);

@@ -1,5 +1,6 @@
 import express from 'express';
 import * as store from './store.js';
+import { apiGate } from './db.js';
 import { requireOwner, resolveOwnerId, authConfigured } from './owner-auth.js';
 import { endpointAllowed, publicKey, pushConfigured, pushToUser } from './push.js';
 
@@ -53,7 +54,9 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   // is called by somebody who is not a member yet. The invite path was dead
   // on arrival and no test noticed, because every test seeded owner_members
   // directly. Unmatched paths must fall through.
-  const auth = requireOwner(log);
+  // Through the API lane first (db.js): portal reads never take the last
+  // connections the machine path needs.
+  const auth = [apiGate, requireOwner(log)];
 
   /**
    * Everything the dashboard draws, in one call.
@@ -64,7 +67,7 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
    * which day a sale is filed under, and the answer for every machine we have
    * is Ulaanbaatar.
    */
-  router.get('/stats', auth, async (req, res) => {
+  router.get('/stats', ...auth, async (req, res) => {
     const ownerId = resolveOwnerId(req, res);
     if (!ownerId) return;
     try {
@@ -104,7 +107,7 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   const BUCKETS = new Set(['paid', 'unpaid', 'failed', 'pending', 'no_cup']);
 
   /** Wraps a read so a query failure never leaks a pg message. */
-  const read = (name, fn) => [auth, async (req, res) => {
+  const read = (name, fn) => [...auth, async (req, res) => {
     const ownerId = resolveOwnerId(req, res);
     if (!ownerId) return;
     try {
@@ -122,6 +125,11 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
 
   router.get('/orders', ...read('orders', async (ownerId, q) => {
     const p = period(q);
+    // `asOf` freezes the upper bound for a multi-page read (the export):
+    // without it, sales landing between page requests shifted every later
+    // page by a row, and the accountant's file repeated or skipped orders.
+    const asOf = q.asOf ? new Date(String(q.asOf)) : null;
+    if (asOf && !Number.isNaN(asOf.getTime()) && asOf.toISOString() < p.to) p.to = asOf.toISOString();
     const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 500);
     const offset = Math.max(Number(q.offset) || 0, 0);
     const bucket = BUCKETS.has(String(q.status)) ? String(q.status) : null;
@@ -148,9 +156,21 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
     return { ...p, products: await store.ownerProducts(ownerId, { ...p, deviceNo: device(q) }) };
   }));
 
-  router.get('/problems', ...read('problems', async (ownerId) => ({
-    problems: await store.ownerProblems(ownerId),
-  })));
+  router.get('/problems', ...read('problems', async (ownerId) => {
+    const [problems, summary] = await Promise.all([store.ownerProblems(ownerId), store.ownerProblemSummary(ownerId)]);
+    return {
+      // At most 100 rows of each kind; `summary` is exact, so the home page
+      // counts and money no longer depend on which rows made the cut.
+      problems,
+      summary: summary.map((r) => ({
+        kind: r.kind,
+        count: r.problem_count,
+        devices: r.devices,
+        amountMnt: Number(r.amount_mnt ?? 0),
+        lastAt: r.last_at,
+      })),
+    };
+  }));
 
   // -------------------------------------------------------------------------
   // Phone notifications (migration 017). A subscription is the person's, so
@@ -161,7 +181,7 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   const str = (v) => (typeof v === 'string' ? v : '');
 
   /** Answers what fn returns, unless fn already answered (a 4xx). */
-  const act = (name, fn) => [auth, json, async (req, res) => {
+  const act = (name, fn) => [...auth, json, async (req, res) => {
     try {
       const out = await fn(req, res);
       if (out !== undefined && !res.headersSent) res.json(out);
@@ -187,7 +207,12 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   router.post('/push/subscribe', ...act('push subscribe', async (req, res) => {
     const sub = readSubscription(req.body);
     if (!sub) return void res.status(400).json({ error: 'INVALID_SUBSCRIPTION' });
-    const row = await store.savePushSubscription(req.owner.userId, { ...sub, notifySales: req.body?.notifySales !== false });
+    const row = await store.savePushSubscription(req.owner.userId, {
+      ...sub,
+      notifySales: req.body?.notifySales !== false,
+      // The session it was made in: signing out (or a revoked session) stops it.
+      sessionId: req.owner.sessionId,
+    });
     return { subscribed: true, notifySales: row?.notify_sales ?? true };
   }));
 
@@ -207,8 +232,18 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
     return { subscribed: Boolean(row), notifySales: row?.notify_sales ?? false };
   }));
 
-  router.post('/push/test', ...act('push test', async (req) => {
+  // A test push goes to every device the person has; one press a while is
+  // what the button is for, not a loop.
+  const testPushes = new Map();
+  setInterval(() => testPushes.clear(), 3600_000).unref();
+  router.post('/push/test', ...act('push test', async (req, res) => {
     if (!pushConfigured()) return { configured: false, sent: 0, failed: 0 };
+    const now = Date.now();
+    const seen = (testPushes.get(req.owner.userId) ?? []).filter((t) => now - t < 3600_000);
+    if (seen.length >= 10 || (seen.length && now - seen[seen.length - 1] < 2_000)) {
+      return void res.status(429).json({ error: 'RATE_LIMITED', retryAfterSeconds: seen.length >= 10 ? 600 : 2 });
+    }
+    testPushes.set(req.owner.userId, [...seen, now]);
     const r = await pushToUser(
       req.owner.userId,
       { title: 'Coffeine', body: 'Мэдэгдэл ажиллаж байна. Орлого орох бүрт ингэж мэдэгдэнэ.', url: '/settings', tag: 'test' },
@@ -237,7 +272,7 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
   }));
 
   /** Who am I, and which businesses can I switch between. */
-  router.get('/me', auth, async (req, res) => {
+  router.get('/me', ...auth, async (req, res) => {
     try {
       const owners = await store.ownersByIds(req.owner.ownerIds);
       res.json({ userId: req.owner.userId, owners });

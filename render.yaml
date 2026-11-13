@@ -83,6 +83,35 @@ services:
         sync: false
 
       # --- Diagnostics readable from a phone on site. No key, no endpoint:
-      #     /recent, /orders, /errors and /check all 404. ---
+      #     /recent, /orders, /errors and /check all 404, and /health shows
+      #     only {ok, push, db}. ---
       - key: DEBUG_KEY
         sync: false
+
+      # --- Phone notifications (017). All three, or push is silently off:
+      #     the owners' settings card says unavailable and no sale reaches a
+      #     phone. Never rotate them — that orphans every subscription. ---
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+
+      # --- Who hears about it when something needs a human: stranded paid
+      #     orders, refunds, a keyring that cannot open credentials. Without
+      #     it the alerts only reach /errors. ---
+      - key: OPERATOR_ALERT_PHONE
+        sync: false
+
+      # --- The portal's login guard and its proof of identity (018). The
+      #     SAME value goes into the portal's Vercel env as GUARD_SECRET.
+      #     Missing on either side, logins work exactly as before, unguarded.
+      #     At least 16 characters. ---
+      - key: GUARD_SECRET
+        sync: false
+
+      # Deliberately absent: QPAY_MOCK, ALLOW_PRIVATE_NOTIFY and
+      # ENV_MERCHANT_ONLY. The first two are for tests on a laptop; the third
+      # sells every machine on the operator's merchant when there is no
+      # database. scripts/preflight.mjs refuses all three.

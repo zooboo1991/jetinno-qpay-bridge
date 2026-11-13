@@ -1,10 +1,13 @@
+-- 2026-11-12: real phone numbers removed from this file (the repository is
+-- public). Already applied in production; to run it again, replace the
+-- <...> placeholders locally and do not commit the result.
 -- =====================================================================
 -- 2026-10-15, at the operator's request: the business named «Хаан тауэр»
--- becomes «Coffeine», and its contact phone becomes 99147668.
+-- becomes «Coffeine», and its contact phone becomes <NEW_CONTACT_PHONE>.
 --
 -- - Exactly one business must match, otherwise nothing changes.
 -- - Unaccepted invite links (sent to the old number) are revoked; issue a
---   new one to 99147668 from the operator page.
+--   new one to <NEW_CONTACT_PHONE> from the operator page.
 -- - People who already log in to this business keep their access.
 -- - Machine labels and locations are not touched.
 -- - The change is recorded in admin_audit by the owners trigger.
@@ -29,7 +32,7 @@ select app.revoke_owner_invite(i.id, 'contact_phone_changed')
 
 update public.owners
    set name = 'Coffeine',
-       contact_phone = app.norm_phone('99147668')
+       contact_phone = app.norm_phone('<NEW_CONTACT_PHONE>')
  where name ~ '[Хх]аан\s*[Тт]ауэр'
 returning id, name, contact_phone,
           (select count(*) from public.owner_members m where m.owner_id = owners.id) as members;

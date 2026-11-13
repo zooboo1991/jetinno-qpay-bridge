@@ -1,9 +1,11 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import * as store from './store.js';
-import { forgetDevice } from './owners.js';
+import { forgetDevice, forgetCredential } from './owners.js';
 import { pushToOwners } from './push.js';
-import { verifyAccessToken } from './owner-auth.js';
+import { verifyAccessToken, isTokenError } from './owner-auth.js';
+import { apiGate } from './db.js';
+import * as qpay from './qpay.js';
 import { sendSms, smsConfigured, localNumber } from './sms.js';
 
 /**
@@ -50,10 +52,22 @@ function requireOperator(log = () => {}) {
       req.operator = { userId };
       next();
     } catch (err) {
-      deny(err.message.split('\n')[0]);
+      // A token that is no good is a 401. A database or JWKS that did not
+      // answer is not the operator's fault, and reading it as "not an
+      // operator" bounced them between /admin and / until the browser quit.
+      if (isTokenError(err)) return deny(err.message.split('\n')[0]);
+      log('admin auth unavailable', req.path, err.message.split('\n')[0]);
+      res.status(503).json({ error: 'UNAVAILABLE' });
     }
   };
 }
+
+/** 8 digits, or +976 / 976 and 8 digits — what an operator types. */
+const localPhone = (v) => {
+  const d = String(v ?? '').replace(/\D/g, '');
+  const local = d.length === 11 && d.startsWith('976') ? d.slice(3) : d;
+  return /^[0-9]{8}$/.test(local) ? local : null;
+};
 
 // No 0/O or 1/I: the reference is read aloud over the phone.
 const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -82,6 +96,7 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     next();
   });
 
+  router.use(apiGate);
   router.use(requireOperator(log));
 
   /** Wraps a handler so a query failure never leaks a pg message to the caller. */
@@ -94,8 +109,10 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     }
   };
 
+  // The full 8-4-4-4-12 shape: a 36-character string of hex and dashes in
+  // any other arrangement reached SQL's ::uuid cast and came back a 500.
   const uuidOrNull = (v) =>
-    typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v) ? v : null;
+    typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? v : null;
 
   router.get('/overview', handler('overview', (req) =>
     store.operatorOverview(req.operator.userId, { timezone: TZ })
@@ -151,9 +168,18 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
   router.get('/reconciliation', handler('reconciliation', async (req) => {
     const ownerId = uuidOrNull(req.query.ownerId);
     if (!ownerId) return { error: 'ownerId required', rows: [] };
+    // Ulaanbaatar days, as every other period in the system: a bare date is
+    // midnight there, `to` is inclusive, and the default is this UB month.
+    // Server-local (UTC) midnight put the first eight hours of every month
+    // in neither month's statement.
+    const DAY = /^\d{4}-\d{2}-\d{2}$/;
+    const ub = (d) => new Date(`${d}T00:00:00+08:00`);
     const now = new Date();
-    const from = req.query.from ? new Date(String(req.query.from)) : new Date(now.getFullYear(), now.getMonth(), 1);
-    const to = req.query.to ? new Date(String(req.query.to)) : now;
+    const todayUb = new Date(now.getTime() + 8 * 3600e3).toISOString().slice(0, 10);
+    const qf = String(req.query.from ?? '');
+    const qt = String(req.query.to ?? '');
+    const from = qf ? (DAY.test(qf) ? ub(qf) : new Date(qf)) : ub(`${todayUb.slice(0, 7)}-01`);
+    const to = qt ? (DAY.test(qt) ? new Date(ub(qt).getTime() + 86400e3) : new Date(qt)) : now;
     if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
       return { error: 'bad date range', rows: [] };
     }
@@ -207,6 +233,12 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
   router.post('/owners/:ownerId/invite', json, handler('invite', async (req) => {
     const ownerId = uuidOrNull(req.params.ownerId);
     if (!ownerId) return { status: 'not_found' };
+    // The number typed AGAIN by the operator. SQL compares it with the one on
+    // the registration; passing the registration's own number back, as this
+    // did, compared a value with itself — and a mistyped digit sent an admin
+    // invite (and with it the business's QPay) to a stranger.
+    const typed = localPhone(req.body?.invitedPhone);
+    if (!typed) return { status: 'invalid_phone' };
     if (!portalOrigin) return { status: 'no_portal_origin' };
     if (!smsConfigured()) return { status: 'sms_not_configured' };
     const phone = await store.ownerContactPhone(ownerId);
@@ -223,7 +255,7 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
           ownerId,
           tokenHash,
           reference: inviteReference(),
-          invitedPhone: phone,
+          invitedPhone: typed,
           role: 'admin',
         });
       } catch (err) {
@@ -325,6 +357,49 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     if (r.out_status === 'ok') forgetDevice(deviceNo);
     log('admin add machine', r.out_status, ownerId);
     return { status: r.out_status, machineId: r.out_machine_id ?? null };
+  }));
+
+  /** Who can act for this business — the console could invite but never see or remove anyone. */
+  router.get('/owners/:ownerId/members', handler('members', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId) return { members: [] };
+    const rows = await store.operatorOwnerMembers(req.operator.userId, ownerId);
+    return {
+      members: rows.map((r) => ({
+        userId: r.out_user_id,
+        role: r.out_role,
+        phoneMasked: r.out_phone_masked,
+        joinedAt: r.out_joined_at,
+        lastSignInAt: r.out_last_sign_in_at,
+      })),
+    };
+  }));
+
+  router.post('/owners/:ownerId/members/:userId/remove', json, handler('remove member', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    const userId = uuidOrNull(req.params.userId);
+    if (!ownerId || !userId) return { status: 'not_found' };
+    const status = await store.operatorRemoveMember(req.operator.userId, ownerId, userId);
+    log('admin remove member', status, ownerId);
+    return { status };
+  }));
+
+  /**
+   * The emergency stop for ONE business's QPay: its machines refuse sales
+   * until it is switched back on. What the README used to prescribe instead
+   * — removing DATABASE_URL — sent every owner's sales to the operator.
+   */
+  router.post('/owners/:ownerId/credential-active', json, handler('credential active', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId || typeof req.body?.active !== 'boolean') return { status: 'not_found', affectedMachines: 0 };
+    const r = await store.operatorSetCredentialActive(req.operator.userId, ownerId, req.body.active);
+    if (r.out_status === 'ok') {
+      // This instance forgets it at once; siblings within the cache TTL.
+      forgetCredential(r.out_credential_id);
+      qpay.evictCredential(r.out_credential_id);
+    }
+    log('admin credential active', r.out_status, ownerId, String(req.body.active));
+    return { status: r.out_status, affectedMachines: r.out_affected_machines ?? 0 };
   }));
 
   router.post('/owners/:ownerId/invoice-code', json, handler('invoice-code', async (req) => {

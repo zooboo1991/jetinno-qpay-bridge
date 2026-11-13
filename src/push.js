@@ -76,15 +76,24 @@ async function deliver(subs, payload, log) {
   if (!subs.length) return { sent: 0, failed: 0 };
   configure();
   const body = JSON.stringify(payload);
-  const results = await Promise.allSettled(
-    subs.map((s) =>
-      webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, body, {
-        TTL: 6 * 3600,
-        urgency: 'high',
-        timeout: 8000,
-      })
-    )
-  );
+  // Ten at a time. Each send is a synchronous encrypt-and-sign and then an
+  // HTTPS request; all at once, a few thousand of them blocked the one
+  // process that also has to answer the machines inside 8 seconds.
+  const results = [];
+  for (let i = 0; i < subs.length; i += 10) {
+    const batch = subs.slice(i, i + 10);
+    results.push(
+      ...(await Promise.allSettled(
+        batch.map((s) =>
+          webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, body, {
+            TTL: 6 * 3600,
+            urgency: 'high',
+            timeout: 8000,
+          })
+        )
+      ))
+    );
+  }
   const okIds = [];
   const goneIds = [];
   let failed = 0;

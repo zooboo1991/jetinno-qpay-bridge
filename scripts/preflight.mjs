@@ -34,7 +34,37 @@ const {
   QPAY_PASSWORD,
   QPAY_INVOICE_CODE,
   DEBUG_KEY,
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY,
+  VAPID_SUBJECT,
+  OPERATOR_ALERT_PHONE,
+  GUARD_SECRET,
+  QPAY_MOCK,
+  ALLOW_PRIVATE_NOTIFY,
+  ENV_MERCHANT_ONLY,
 } = process.env;
+
+// ---- 0. switches that must never reach production -----------------------
+QPAY_MOCK === '1'
+  ? bad('QPAY_MOCK', 'тохируулсан байна: QPay-гүйгээр "төлөгдсөн" гэж үзэж, /mock/pay нээлттэй болно — production-д БОЛОХГҮЙ')
+  : ok('QPAY_MOCK', 'тохируулаагүй');
+ALLOW_PRIVATE_NOTIFY === '1'
+  ? bad('ALLOW_PRIVATE_NOTIFY', 'тохируулсан байна: дотоод сүлжээний хаяг руу notify илгээх боломжтой болно')
+  : ok('ALLOW_PRIVATE_NOTIFY', 'тохируулаагүй');
+ENV_MERCHANT_ONLY === '1'
+  ? bad('ENV_MERCHANT_ONLY', 'тохируулсан байна: сан байхгүй үед бүх машин операторын дансаар зарна')
+  : ok('ENV_MERCHANT_ONLY', 'тохируулаагүй');
+
+// ---- 0b. push, alerts, login guard --------------------------------------
+VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && VAPID_SUBJECT
+  ? ok('VAPID_* (утасны мэдэгдэл)')
+  : warn('VAPID_* (утасны мэдэгдэл)', 'гурвуулаа хэрэгтэй — үгүй бол push унтраалттай');
+OPERATOR_ALERT_PHONE
+  ? ok('OPERATOR_ALERT_PHONE')
+  : warn('OPERATOR_ALERT_PHONE', 'тохируулаагүй — анхааруулга зөвхөн /errors-д очно');
+GUARD_SECRET && GUARD_SECRET.length >= 16
+  ? ok('GUARD_SECRET', 'portal-ын Vercel env-д ижил утга байх ёстой')
+  : warn('GUARD_SECRET', 'тохируулаагүй (эсвэл 16 тэмдэгтээс богино) — нэвтрэх оролдлого хязгааргүй');
 
 // ---- 1. the two that stop the process booting ---------------------------
 JETINNO_USERNAME && JETINNO_APIKEY
@@ -92,11 +122,27 @@ if (!DATABASE_URL) {
       const { rows } = await pool.query(`select ${expr} is not null as present`);
       rows[0].present ? ok(`Хүснэгт ${label}`) : bad(`Хүснэгт ${label}`, 'миграц дутуу');
     }
+    // One object from each migration, newest last: the bridge calls them
+    // all, and a migration skipped in the SQL editor surfaces otherwise as
+    // "function does not exist" on the first request that needs it.
     for (const [label, fn] of [
       ['app.owner_stats', 'owner_stats'],
       ['app.give_up_exhausted', 'give_up_exhausted'],
       ['app.phone_may_receive_otp', 'phone_may_receive_otp'],
       ['app.accept_owner_invite', 'accept_owner_invite'],
+      ['007 app.operator_overview', 'operator_overview'],
+      ['008 app.operator_provision_owner', 'operator_provision_owner'],
+      ['009 app.is_operator_user', 'is_operator_user'],
+      ['010 app.operator_set_credential', 'operator_set_credential'],
+      ['011 app.sms_budget', 'sms_budget'],
+      ['012 app.claim_invites_by_phone', 'claim_invites_by_phone'],
+      ['013 app.operator_set_invoice_code', 'operator_set_invoice_code'],
+      ['014 app.owner_orders', 'owner_orders'],
+      ['015 app.operator_import_faults', 'operator_import_faults'],
+      ['016 app.operator_add_machine', 'operator_add_machine'],
+      ['017 app.operator_create_notification', 'operator_create_notification'],
+      ['018 app.reserve_verify_attempt', 'reserve_verify_attempt'],
+      ['018 app.auth_attempt', 'auth_attempt'],
     ]) {
       const { rows } = await pool.query(
         `select exists(select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace

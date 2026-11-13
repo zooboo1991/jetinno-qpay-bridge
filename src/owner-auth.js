@@ -53,7 +53,13 @@ function keySet() {
  * every visitor to the portal already has in their browser.
  */
 export async function verifyAccessToken(token) {
-  const header = decodeProtectedHeader(token);
+  let header;
+  try {
+    header = decodeProtectedHeader(token);
+  } catch {
+    // Not a JWT at all: that is the token's fault, not the bridge's.
+    throw new Error('BAD_TOKEN');
+  }
   if (!header.alg || header.alg === 'none' || header.alg.startsWith('HS')) {
     throw new Error('BAD_ALG');
   }
@@ -74,6 +80,31 @@ export async function adminOwnerIds(userId) {
 }
 
 const BEARER = /^Bearer\s+([A-Za-z0-9._~+/-]+=*)$/;
+
+/*
+ * Which failures mean "this token is no good" — and so 401 — as opposed to
+ * "the bridge could not check it": a database that did not answer, a JWKS
+ * fetch that timed out. Those used to be 401 too, and the portal, reading 401
+ * as "your session is over", signed owners out and bounced operators between
+ * /admin and / until the browser gave up — during exactly the incidents when
+ * nothing about their session was wrong. They are 503 now.
+ */
+const TOKEN_ERROR_CODES = new Set([
+  'ERR_JWT_EXPIRED',
+  'ERR_JWT_CLAIM_VALIDATION_FAILED',
+  'ERR_JWT_INVALID',
+  'ERR_JWS_INVALID',
+  'ERR_JWS_SIGNATURE_VERIFICATION_FAILED',
+  'ERR_JOSE_ALG_NOT_ALLOWED',
+  'ERR_JOSE_NOT_SUPPORTED',
+  'ERR_JWKS_NO_MATCHING_KEY',
+  'ERR_JWKS_MULTIPLE_MATCHING_KEYS',
+]);
+export function isTokenError(err) {
+  if (!err) return false;
+  if (err.message === 'BAD_ALG' || err.message === 'NO_SUBJECT' || err.message === 'BAD_TOKEN') return true;
+  return TOKEN_ERROR_CODES.has(err.code);
+}
 
 /**
  * Express middleware. Populates `req.owner = { userId, ownerIds }`.
@@ -99,7 +130,9 @@ export function requireOwner(log = () => {}) {
       req.owner = { userId, sessionId, ownerIds };
       next();
     } catch (err) {
-      deny(err.message.split('\n')[0]);
+      if (isTokenError(err)) return deny(err.message.split('\n')[0]);
+      log('owner auth unavailable', req.path, err.message.split('\n')[0]);
+      res.status(503).json({ error: 'UNAVAILABLE' });
     }
   };
 }

@@ -15,6 +15,22 @@ create table if not exists auth.users (
   raw_user_meta_data jsonb default '{}'::jsonb
 );
 
+alter table auth.users add column if not exists last_sign_in_at timestamptz;
+
+-- GoTrue's session and refresh-token tables, the columns the bridge touches.
+create table if not exists auth.sessions (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null,
+  created_at timestamptz default now()
+);
+create table if not exists auth.refresh_tokens (
+  id         bigint generated always as identity primary key,
+  user_id    varchar(255),
+  session_id uuid,
+  token      varchar(255),
+  revoked    boolean default false
+);
+
 create or replace function auth.uid() returns uuid
 language sql stable as $$
   select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid

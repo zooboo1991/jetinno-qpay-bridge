@@ -456,6 +456,43 @@ await check('SMS-ийн илгээлт sms_sends-д announcement гэж бичи
   return rows[0].n === 3 || String(rows[0].n);
 });
 
+// A third business of their own, so these checks touch nobody else's counts.
+const c = await registerOwner({
+  ownerName: 'Гамма ХХК', contactPhone: '99110003', deviceNo: `NC${Math.floor(Math.random() * 1e8)}`, location: 'C',
+  username: 'userC', password: 'passC', invoiceCode: 'INV_C',
+});
+// ---- 018: ten devices per person, and a signed-out session stops receiving ---------
+await check('нэг хүн 12 төхөөрөмж бүртгүүлсэн ч хамгийн сүүлийн 10 нь л үлдэнэ', async () => {
+  const UC = randomUUID();
+  await query(`insert into auth.users (id, phone) values ($1, '97699110099')`, [UC]);
+  await query(`insert into public.owner_members (owner_id, user_id, role) values ($1, $2, 'admin')`, [c.ownerId, UC]);
+  const token = await mint(UC);
+  for (let i = 0; i < 12; i++) await call('/owner/v1/push/subscribe', { token, body: phone(`uc-${i}`) });
+  const { rows } = await query(`select count(*)::int n from public.push_subscriptions where user_id = $1`, [UC]);
+  const newest = await query(`select count(*)::int n from public.push_subscriptions where user_id = $1 and endpoint like '%/uc-11'`, [UC]);
+  return (rows[0].n === 10 && newest.rows[0].n === 1) || `rows=${rows[0].n}`;
+});
+
+await check('гарсан (устсан) сесс дээрх төхөөрөмжид push очихгүй, амьд сесс дээрхэд очно', async () => {
+  const UD = randomUUID();
+  await query(`insert into auth.users (id, phone) values ($1, '97699110098')`, [UD]);
+  await query(`insert into public.owner_members (owner_id, user_id, role) values ($1, $2, 'admin')`, [c.ownerId, UD]);
+  const live = randomUUID();
+  const dead = randomUUID();
+  await query(`insert into auth.sessions (id, user_id) values ($1, $2)`, [live, UD]);
+  const tokenFor = (sid) =>
+    new SignJWT({ amr: [{ method: 'otp', timestamp: Math.floor(Date.now() / 1000) }], session_id: sid })
+      .setProtectedHeader({ alg: 'ES256', kid: 'k1' }).setSubject(UD).setIssuedAt()
+      .setIssuer(`${ISSUER_BASE}/auth/v1`).setAudience('authenticated').setExpirationTime('1h').sign(jwtPrivate);
+  await call('/owner/v1/push/subscribe', { token: await tokenFor(live), body: phone('ud-live') });
+  await call('/owner/v1/push/subscribe', { token: await tokenFor(dead), body: phone('ud-dead') });
+  const from = pushIn.length;
+  await call('/owner/v1/push/test', { token: await tokenFor(live), body: {} });
+  await sleep(500);
+  return (pushesTo('ud-live', from).length === 1 && pushesTo('ud-dead', from).length === 0) ||
+    JSON.stringify(pushIn.slice(from).map((p) => p.to));
+});
+
 bridge.kill();
 for (const s of [jwks, qpayFake, machine, smsFake, pushService]) s.close();
 await close();

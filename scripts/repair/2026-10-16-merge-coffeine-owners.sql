@@ -1,6 +1,9 @@
+-- 2026-11-12: real phone numbers removed from this file (the repository is
+-- public). Already applied in production; to run it again, replace the
+-- <...> placeholders locally and do not commit the result.
 -- =====================================================================
 -- 2026-10-16, at the operator's request: two businesses ended up with the
--- contact phone 99147668 — «Coffeine» (QPay connected, formerly Хаан тауэр)
+-- contact phone <SHARED_PHONE> — «Coffeine» (QPay connected, formerly Хаан тауэр)
 -- and «coffeine» (invited, no QPay yet). Merge them into the connected one:
 --
 --   - the duplicate's machine(s) move to the connected business and its
@@ -10,8 +13,8 @@
 --   - anyone who joined the duplicate joins the connected business;
 --   - the duplicate's pending credential, invites and the business itself
 --     are deleted;
---   - the connected business's contact phone becomes 90777400, and its open
---     invites (sent to 99147668) are revoked.
+--   - the connected business's contact phone becomes <NEW_CONTACT_PHONE>, and its open
+--     invites (sent to <SHARED_PHONE>) are revoked.
 --
 -- One transaction: any check that fails changes nothing.
 -- Copy it from chat or the file, not through pbcopy (Cyrillic messages).
@@ -23,7 +26,7 @@ create temp table merge_result (keeper uuid, dup_name text, moved_machines int, 
 
 do $$
 declare
-  v_phone    text := app.norm_phone('99147668');
+  v_phone    text := app.norm_phone('<SHARED_PHONE>');
   n          int;
   v_keeper   uuid;
   v_cred     uuid;
@@ -34,7 +37,7 @@ declare
 begin
   select count(*) into n from public.owners where app.norm_phone(contact_phone) = v_phone;
   if n <> 2 then
-    raise exception '99147668 утастай % эзэмшигч олдлоо, 2 байх ёстой. Юу ч өөрчлөгдсөнгүй.', n;
+    raise exception '<SHARED_PHONE> утастай % эзэмшигч олдлоо, 2 байх ёстой. Юу ч өөрчлөгдсөнгүй.', n;
   end if;
 
   -- The keeper is the one whose QPay is connected; exactly one may be.
@@ -93,7 +96,7 @@ begin
      from public.owner_invites i
     where i.owner_id = v_keeper and i.accepted_at is null and i.revoked_at is null;
 
-  update public.owners set contact_phone = app.norm_phone('90777400') where id = v_keeper;
+  update public.owners set contact_phone = app.norm_phone('<NEW_CONTACT_PHONE>') where id = v_keeper;
 
   insert into merge_result values (v_keeper, v_dup_name, n_machines, n_orders);
 end $$;

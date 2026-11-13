@@ -90,6 +90,17 @@ await check('сангийн алдаа хүсэлтэд 503 болж буцна 
   return r.status === 503 || `HTTP ${r.status}`;
 });
 
+// 018: a database that does not answer is not "your session is over". The
+// portal read every 401 that way and signed owners out, or bounced operators
+// between /admin and / until the browser gave up.
+await check('сан унасан үед owner/admin API 401 биш 503 буцаана (нэвтрэлт дууссан гэж ойлгуулахгүй)', async () => {
+  const h = { authorization: `Bearer ${token}` };
+  const owner = await fetch(`http://localhost:${PORT}/owner/v1/me`, { headers: h, signal: timed(10000) });
+  const admin = await fetch(`http://localhost:${PORT}/admin/v1/me`, { headers: h, signal: timed(10000) });
+  const bad = await fetch(`http://localhost:${PORT}/owner/v1/me`, { headers: { authorization: 'Bearer x.y.z' }, signal: timed(10000) });
+  return (owner.status === 503 && admin.status === 503 && bad.status === 401) || `owner=${owner.status} admin=${admin.status} bad=${bad.status}`;
+});
+
 await check('тэр алдааны дараа гүүр амьд хэвээр — бусад машин зарсаар', async () => {
   await sleep(300);
   return (bridge.exitCode === null && (await health()) === 200) || `exit=${bridge.exitCode}`;

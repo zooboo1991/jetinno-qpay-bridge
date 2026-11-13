@@ -2,6 +2,7 @@ import express from 'express';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { query } from './db.js';
 import { sendSms, smsConfigured } from './sms.js';
+import * as alerts from './alerts.js';
 
 /**
  * Supabase's "Send SMS" auth hook.
@@ -84,6 +85,16 @@ function otpMessage(code) {
   return `Coffeine нэвтрэх код: ${code}. Хэнд ч бүү дамжуул.`;
 }
 
+/** One page per number per hour, at most. */
+const capAlerted = new Map();
+function capAlert(phone, reason) {
+  const k = String(phone).slice(-8);
+  const now = Date.now();
+  if (now - (capAlerted.get(k) ?? 0) < 3600_000) return;
+  capAlerted.set(k, now);
+  alerts.pageOperator('login SMS budget exhausted for a number', { last4: k.slice(-4), reason: reason ?? 'budget' });
+}
+
 export function authHook({ log = () => {} } = {}) {
   const router = express.Router();
 
@@ -114,6 +125,18 @@ export function authHook({ log = () => {} } = {}) {
         return res.status(400).json({ error: { message: 'bad payload' } });
       }
 
+      // A phone CHANGE: Supabase puts the code meant for the NEW number in
+      // this call, with user.phone still the old one. Texting user.phone gave
+      // the person asking for the change the code that proves a number they
+      // do not hold — and with it any open invite for that number, or an
+      // operator's console. Nothing in this product changes a phone, so the
+      // request is refused, which makes Supabase abort the change.
+      const newPhone = payload?.user?.new_phone ?? payload?.user?.phone_change;
+      if (newPhone && String(newPhone).replace(/\D/g, '') !== String(phone).replace(/\D/g, '')) {
+        log('send-sms refused', 'phone change');
+        return res.status(403).json({ error: { message: 'not permitted' } });
+      }
+
       try {
         // Invite-only, enforced in SQL. Without this, anyone can type any
         // Mongolian number into the login screen and make us text it.
@@ -131,6 +154,9 @@ export function authHook({ log = () => {} } = {}) {
         const { rows: budget } = await query(`select * from app.sms_budget($1)`, [phone]);
         if (!budget[0]?.out_allowed) {
           log('send-sms refused', budget[0]?.out_reason ?? 'budget');
+          // A number at its cap cannot log in by SMS until the window passes —
+          // and a stranger can put it there. Somebody should know.
+          capAlert(phone, budget[0]?.out_reason);
           return res.status(429).json({
             error: {
               message: `Дахин код авахын тулд ${budget[0]?.out_retry_minutes ?? 60} минут хүлээнэ үү.`,
@@ -138,7 +164,10 @@ export function authHook({ log = () => {} } = {}) {
           });
         }
 
-        const result = await sendSms(phone, otpMessage(code));
+        // Inside Supabase's own 5-second hook deadline, with the two queries
+        // above: past it, the owner is shown a failure while the code still
+        // goes out and still counts against their hourly budget.
+        const result = await sendSms(phone, otpMessage(code), { timeoutMs: 3500 });
 
         // Whatever the gateway echoed back, the code does not go into the
         // database with it. This gateway returns a small status object and

@@ -55,6 +55,8 @@ import * as qpay from './qpay.js';
 import * as store from './store.js';
 import * as owners from './owners.js';
 import * as alerts from './alerts.js';
+import { isTokenError } from './owner-auth.js';
+import { trustedClient } from './guard.js';
 
 function reqEnv(name) {
   const v = process.env[name];
@@ -70,7 +72,10 @@ const PORTAL_ORIGIN = reqEnv('PORTAL_ORIGIN').replace(/\/+$/, ''); // e.g. https
 // verification failed on a URL they never saw.
 const PUBLIC_URL = (process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL ?? '').replace(/\/+$/, '');
 if (!/^https?:\/\//.test(PUBLIC_URL)) throw new Error('PUBLIC_URL or RENDER_EXTERNAL_URL must be set — QPay needs a callback URL');
-const JWKS = createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`));
+const JWKS = createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`), {
+  cooldownDuration: 30_000,
+  timeoutDuration: 3_000,
+});
 
 /**
  * Budgets. An owner configures a credential a handful of times in the life of
@@ -193,13 +198,54 @@ async function authenticate(req) {
     const { payload } = await jwtVerify(jwt, JWKS, {
       issuer: `${SUPABASE_URL}/auth/v1`,
       audience: 'authenticated',
+      algorithms: ['ES256', 'RS256'],
       clockTolerance: 30,
     });
-    return payload.sub ? { userId: payload.sub, otpAt: otpTimestamp(payload) } : null;
-  } catch {
+    return payload.sub
+      ? { userId: payload.sub, sessionId: payload.session_id ?? null, otpAt: otpTimestamp(payload) }
+      : null;
+  } catch (err) {
+    // A bad token is a 401. A JWKS that could not be fetched is not the
+    // caller's fault; the routes answer that 503 (see `denied`).
+    if (!isTokenError(err)) {
+      safeLog({ event: 'jwt_unverifiable', outcome: 'unavailable' });
+      return { unavailable: true };
+    }
     safeLog({ event: 'jwt_invalid', outcome: 'rejected' });
     return null;
   }
+}
+
+/** Answers for a failed authenticate(): 401 for no valid token, 503 when it could not be checked. */
+function denied(res, actor) {
+  return actor?.unavailable ? reply(res, 503, 'UNAVAILABLE') : reply(res, 401, 'FORBIDDEN');
+}
+const authed = (actor) => Boolean(actor && !actor.unavailable);
+
+/**
+ * The end user's IP and user agent: as the portal vouched for them (with the
+ * shared guard key), else what this request itself shows — which, behind the
+ * portal, is Vercel's egress and Node's fetch, identical for every owner.
+ */
+function client(req) {
+  const t = trustedClient(req);
+  return {
+    ip: t?.ip ?? req.ip,
+    userAgent: t?.userAgent ?? req.get('user-agent'),
+    xff: req.get('x-forwarded-for'),
+  };
+}
+
+/**
+ * The business the portal's form showed, when it says. A person with two
+ * businesses who switched in another tab used to have the first business's
+ * merchant activated on the second — every sale of the second then landed in
+ * the first's account. A credential whose owner is not the one the page
+ * showed is refused before anything is touched.
+ */
+function ownerMismatch(body, ownerId) {
+  const expected = body?.expectedOwnerId;
+  return typeof expected === 'string' && expected !== '' && expected !== ownerId;
 }
 
 /**
@@ -301,8 +347,12 @@ function qpayErrorCode(err) {
  * response and never to the log.
  */
 function qpayRefusalForOperator(err, { username, password }) {
-  const raw = String(err?.message ?? '');
-  let text = raw.replace(/^qpay invoice /, '').slice(0, 200);
+  // The message carries only QPay's code (qpay.js); its words are on the
+  // non-enumerable qpayBody, and only here, scrubbed, do they go anywhere.
+  const raw = err?.qpayBody !== undefined
+    ? `${err?.status ?? ''}: ${err.qpayBody}`
+    : String(err?.message ?? '').replace(/^qpay invoice /, '');
+  let text = raw.slice(0, 200);
   for (const secret of [username, password]) {
     if (secret && secret.length >= 3) text = text.split(secret).join('***');
   }
@@ -387,13 +437,19 @@ async function runVerification({ credentialId, ownerId, username, password, invo
 /** Best effort. A live 10₮ QR nobody will ever see is a trivial loss; an
  *  UNTRACKED one is not, so a failed cancel is recorded and pages the operator. */
 async function cancelVerifyInvoice({ credentialId, ownerId, sealedBlob, invoiceId }) {
-  if (!invoiceId || !sealedBlob) return;
+  if (!invoiceId) return;
+  if (!sealedBlob) {
+    // Nothing can cancel it without the candidate's login. Said out loud,
+    // not skipped: a payable QR nobody tracks is the thing to avoid.
+    alerts.pageOperator('verify invoice left uncancelled (staged credential gone)', { credentialId, invoiceId });
+    return;
+  }
   try {
     const creds = open(sealedBlob, { context: credentialAad({ credentialId, ownerId }) });
     const client = qpay.forOwner({ ownerId, credentialId, ...creds });
     await client.cancelInvoice(invoiceId, AbortSignal.timeout(TIMEOUT.cancel));
   } catch {
-    await store.logCredentialEvent(credentialId, 'VERIFY_CANCEL_FAILED', { invoiceId }).catch(() => {});
+    await store.logCredentialEvent(credentialId, 'verify_cancel_failed', { invoice_id: invoiceId }).catch(() => {});
     alerts.pageOperator('verify invoice left uncancelled', { credentialId, invoiceId });
   }
 }
@@ -405,7 +461,7 @@ router.post('/invites/redeem', async (req, res) => {
   const body = req.body;
   req.body = undefined;
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
 
   const token = String(body?.token ?? '');
   if (token.length < 20 || token.length > 128) return reply(res, 400, 'INVALID_INPUT', { field: 'token' });
@@ -444,7 +500,7 @@ const CLAIM_WINDOW_SECONDS = 600;
 router.post('/invites/claim', async (req, res) => {
   req.body = undefined;
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
   const now = Math.floor(Date.now() / 1000);
   if (!actor.otpAt || now - actor.otpAt > CLAIM_WINDOW_SECONDS) return reply(res, 401, 'REAUTH_REQUIRED');
 
@@ -470,7 +526,7 @@ const STEP_UP_RECORD_WINDOW_SECONDS = 300;
 
 router.get('/step-up', async (req, res) => {
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
   // With the SMS check off, the portal is told so and asks for no code.
   const age = SMS_STEP_UP ? await store.stepUpAgeSeconds(actor.userId) : 0;
   return reply(res, 200, 'OK', {
@@ -484,7 +540,7 @@ router.get('/step-up', async (req, res) => {
 router.post('/step-up', async (req, res) => {
   req.body = undefined;
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
   // The proof is the token's own OTP timestamp, not the portal's say-so: a
   // portal that could stamp step-up at will would make the check decorative.
   const now = Math.floor(Date.now() / 1000);
@@ -518,11 +574,12 @@ router.post('/credentials/verify', async (req, res) => {
   let actorUserId = null;
   let fp = null;
   let outcome = 'error';
-  let recordAttempt = false;
+  let attemptId = null;
+  const who = client(req);
 
   try {
     const actor = await authenticate(req);
-    if (!actor) { await pad(); return reply(res, 401, 'FORBIDDEN'); }
+    if (!authed(actor)) { await pad(); return denied(res, actor); }
     actorUserId = actor.userId;
 
     const fields = readCredentialFields(body);
@@ -542,6 +599,11 @@ router.post('/credentials/verify', async (req, res) => {
       return reply(res, 404, 'FORBIDDEN');
     }
     ownerId = slot.out_owner_id;
+    if (ownerMismatch(body, ownerId)) {
+      safeLog({ event: 'owner_mismatch', ownerId, credentialId, actorUserId, outcome: 'rejected' });
+      await pad();
+      return reply(res, 409, 'OWNER_MISMATCH');
+    }
 
     // QPay hands the owner three things together: username, password and
     // invoice code. The owner may type the code; if they leave it blank the
@@ -573,12 +635,19 @@ router.post('/credentials/verify', async (req, res) => {
     }
 
     fp = usernameFp(fields.username);
-    const budget = await store.credentialVerifyBudget(ownerId, fp, LIMITS);
+    // Reserved, not read: decided and recorded as 'pending' under a per-owner
+    // lock (018). Read-then-record let forty parallel requests all see an
+    // empty ledger and all reach QPay.
+    const budget = await store.reserveVerifyAttempt(
+      { ownerId, credentialId, actorUserId, usernameFp: fp, remoteIp: who.ip, userAgent: who.userAgent },
+      LIMITS
+    );
     if (!budget.out_allowed) {
-      await store.recordVerifyAttempt({
-        ownerId, credentialId, actorUserId, usernameFp: fp, outcome: 'locked',
-        remoteIp: req.ip, userAgent: req.get('user-agent'),
-      }).catch(() => {});
+      if (budget.out_reason === 'BREAKER') {
+        alerts.pageOperator('credential verification circuit breaker tripped', {});
+        await pad();
+        return reply(res, 503, 'RATE_LIMITED', { retryAfterMinutes: budget.out_retry_minutes ?? 30 });
+      }
       if (budget.out_reason === 'TOO_MANY_MERCHANTS') {
         alerts.pageOperator('third distinct QPay username in 24h', { ownerId });
       }
@@ -586,14 +655,8 @@ router.post('/credentials/verify', async (req, res) => {
       await pad();
       return reply(res, 429, budget.out_reason, { retryAfterMinutes: budget.out_retry_minutes });
     }
+    attemptId = budget.out_attempt_id;
 
-    if ((await store.globalAuthFails(10)) > LIMITS.globalAuthFailsPer10Min) {
-      alerts.pageOperator('credential verification circuit breaker tripped', {});
-      await pad();
-      return reply(res, 503, 'RATE_LIMITED', { retryAfterMinutes: 30 });
-    }
-
-    recordAttempt = true;
     const nonce = newNonce();
     let v;
     try {
@@ -608,15 +671,16 @@ router.post('/credentials/verify', async (req, res) => {
     } catch (err) {
       const kind = classify(err);
       if (kind === 'qpay_unreachable') {
+        // Recorded, never counted: an outage must not lock out every honest
+        // owner at once.
         outcome = 'qpay_unreachable';
-        recordAttempt = false; // an outage must not lock out every honest owner at once
         safeLog({ event: 'verify_failed', ownerId, credentialId, actorUserId, outcome, incident });
         await pad();
         return reply(res, 502, 'QPAY_UNREACHABLE');
       }
       if (kind === 'auth_failed') {
         outcome = 'auth_failed';
-        await store.recordVerifyFailure(credentialId, actorUserId, 'QPAY_AUTH_FAILED', req.ip, req.get('user-agent')).catch(() => {});
+        await store.recordVerifyFailure(credentialId, actorUserId, 'QPAY_AUTH_FAILED', who.ip, who.userAgent).catch(() => {});
         // An owner who fat-fingers retries their OWN username. Someone testing
         // a username this owner has never successfully configured is not a
         // confused shop manager.
@@ -633,7 +697,7 @@ router.post('/credentials/verify', async (req, res) => {
         await store.recordVerifyFailure(
           credentialId, actorUserId,
           qpayCode ? `QPAY_${qpayCode}`.slice(0, 40) : 'QPAY_INVOICE_CODE_REJECTED',
-          req.ip, req.get('user-agent')
+          who.ip, who.userAgent
         ).catch(() => {});
         safeLog({ event: 'verify_failed', ownerId, credentialId, actorUserId, outcome, status: qpayCode, incident });
         // Without QPay's own words every refusal here looked the same — and
@@ -667,7 +731,7 @@ router.post('/credentials/verify', async (req, res) => {
       credentialId, actorUserId, sealed: v.sealed, keyId: v.keyId, fp: v.fp,
       usernameHint: v.usernameHint, invoiceCodeHint: v.invoiceCodeHint,
       nonce, invoiceId: v.invoiceId, ttlMinutes: VERIFY_TTL_MINUTES,
-      remoteIp: req.ip, xff: req.get('x-forwarded-for'), userAgent: req.get('user-agent'),
+      remoteIp: who.ip, xff: who.xff, userAgent: who.userAgent,
     });
 
     if (begun.out_status !== 'ok') {
@@ -687,7 +751,7 @@ router.post('/credentials/verify', async (req, res) => {
     // function makes (admin, duplicate merchant, state) still runs.
     const conf = await store.confirmCredentialVerification({
       credentialId, actorUserId, nonce,
-      remoteIp: req.ip, xff: req.get('x-forwarded-for'), userAgent: req.get('user-agent'),
+      remoteIp: who.ip, xff: who.xff, userAgent: who.userAgent,
     });
     // The probe invoice proved the invoice code; nobody needs to read it.
     await cancelVerifyInvoice({ credentialId, ownerId, sealedBlob: v.sealed, invoiceId: v.invoiceId });
@@ -704,7 +768,7 @@ router.post('/credentials/verify', async (req, res) => {
     // Detection, not prevention: the number on the sales paperwork hears
     // about every change, whoever made it.
     alerts.notifyOwnerCredentialChanged(ownerId).catch(() => {});
-    await store.revokeOtherSessions(actorUserId).catch(() => {});
+    await store.revokeOtherSessions(actorUserId, actor.sessionId).catch(() => {});
 
     outcome = 'ok';
     safeLog({ event: 'verify_activated', ownerId, credentialId, actorUserId, outcome, ms: Date.now() - startedAt });
@@ -719,12 +783,9 @@ router.post('/credentials/verify', async (req, res) => {
     await pad();
     return reply(res, 500, 'SERVER_ERROR', { incident });
   } finally {
-    if (recordAttempt) {
-      await store.recordVerifyAttempt({
-        ownerId, credentialId, actorUserId, usernameFp: fp, outcome,
-        remoteIp: req.ip, userAgent: req.get('user-agent'),
-      }).catch(() => {});
-    }
+    // The reserved attempt gets its real outcome. invoice_failed now has a
+    // value of its own (018) instead of an insert that failed its check.
+    if (attemptId) await store.finishVerifyAttempt(attemptId, outcome).catch(() => {});
   }
 });
 
@@ -742,16 +803,23 @@ router.post('/credentials/confirm', async (req, res) => {
   };
 
   const actor = await authenticate(req);
-  if (!actor) { await pad(); return reply(res, 401, 'FORBIDDEN'); }
+  if (!authed(actor)) { await pad(); return denied(res, actor); }
 
   const credentialId = String(body?.credentialId ?? '');
   const nonce = String(body?.nonce ?? '').trim();
   if (!UUID.test(credentialId)) { await pad(); return reply(res, 400, 'INVALID_INPUT', { field: 'credentialId' }); }
   if (!/^[0-9]{4}$/.test(nonce)) { await pad(); return reply(res, 400, 'INVALID_INPUT', { field: 'nonce' }); }
 
+  const slot = await store.credentialSlot(credentialId, actor.userId);
+  if (slot && ownerMismatch(body, slot.out_owner_id)) { await pad(); return reply(res, 409, 'OWNER_MISMATCH'); }
+
+  // Read before the confirm: on exhaustion or expiry it clears the staged
+  // blob, and without it the probe invoice could never be cancelled.
+  const stagedBlob = await store.pendingSealed(credentialId).catch(() => null);
+  const who = client(req);
   const r = await store.confirmCredentialVerification({
     credentialId, actorUserId: actor.userId, nonce,
-    remoteIp: req.ip, xff: req.get('x-forwarded-for'), userAgent: req.get('user-agent'),
+    remoteIp: who.ip, xff: who.xff, userAgent: who.userAgent,
   });
   safeLog({ event: 'verify_confirm', credentialId, actorUserId: actor.userId, outcome: r.out_status });
 
@@ -769,7 +837,7 @@ router.post('/credentials/confirm', async (req, res) => {
     // sales paperwork, NOT the session's phone — otherwise a hijacked identity
     // silences its own alert. No link in the body, ever (see the no-links rule).
     alerts.notifyOwnerCredentialChanged(r.out_owner_id).catch(() => {});
-    await store.revokeOtherSessions(actor.userId).catch(() => {});
+    await store.revokeOtherSessions(actor.userId, actor.sessionId).catch(() => {});
 
     await pad();
     return reply(res, 200, 'OK', {
@@ -786,7 +854,7 @@ router.post('/credentials/confirm', async (req, res) => {
   if (r.out_status === 'nonce_exhausted' || r.out_status === 'expired') {
     await cancelVerifyInvoice({
       credentialId, ownerId: r.out_owner_id,
-      sealedBlob: null, invoiceId: r.out_invoice_id,
+      sealedBlob: stagedBlob, invoiceId: r.out_invoice_id,
     });
     await pad();
     return reply(res, 409, r.out_status.toUpperCase());
@@ -805,16 +873,20 @@ router.post('/credentials/abort', async (req, res) => {
   const body = req.body;
   req.body = undefined;
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
   const credentialId = String(body?.credentialId ?? '');
   if (!UUID.test(credentialId)) return reply(res, 400, 'INVALID_INPUT', { field: 'credentialId' });
 
   const slot = await store.credentialSlot(credentialId, actor.userId);
   if (!slot || !slot.out_is_admin) return reply(res, 404, 'FORBIDDEN');
+  if (ownerMismatch(body, slot.out_owner_id)) return reply(res, 409, 'OWNER_MISMATCH');
 
+  // The staged blob, before the abort clears it: the probe invoice lives on
+  // the candidate merchant and only its login can cancel it.
+  const stagedBlob = await store.pendingSealed(credentialId).catch(() => null);
   const r = await store.abortCredentialVerification(credentialId, actor.userId, 'owner_cannot_see_invoice');
   if (r.out_status === 'ok') {
-    await cancelVerifyInvoice({ credentialId, ownerId: r.out_owner_id, sealedBlob: null, invoiceId: r.out_invoice_id });
+    await cancelVerifyInvoice({ credentialId, ownerId: r.out_owner_id, sealedBlob: stagedBlob, invoiceId: r.out_invoice_id });
     // This is the wrong-account signal firing. It is the single most valuable
     // alert in the whole feature, and the operator is on site right now.
     alerts.pageOperator('owner could not see the verification invoice — WRONG MERCHANT ACCOUNT', {
@@ -833,10 +905,14 @@ router.post('/credentials/:credentialId/active', async (req, res) => {
   const body = req.body;
   req.body = undefined;
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
   const { credentialId } = req.params;
   if (!UUID.test(credentialId)) return reply(res, 400, 'INVALID_INPUT', { field: 'credentialId' });
   if (typeof body?.active !== 'boolean') return reply(res, 400, 'INVALID_INPUT', { field: 'active' });
+  if (body?.expectedOwnerId !== undefined) {
+    const slot = await store.credentialSlot(credentialId, actor.userId);
+    if (slot && ownerMismatch(body, slot.out_owner_id)) return reply(res, 409, 'OWNER_MISMATCH');
+  }
 
   // Turning a credential back ON is a money-direction change, so it needs the
   // same freshness as one. Turning it OFF must never be gated: a person who
@@ -861,7 +937,7 @@ router.post('/credentials/:credentialId/active', async (req, res) => {
 // ===========================================================================
 router.get('/credentials/:credentialId', async (req, res) => {
   const actor = await authenticate(req);
-  if (!actor) return reply(res, 401, 'FORBIDDEN');
+  if (!authed(actor)) return denied(res, actor);
   const { credentialId } = req.params;
   if (!UUID.test(credentialId)) return reply(res, 400, 'INVALID_INPUT', { field: 'credentialId' });
 
@@ -920,7 +996,8 @@ operatorRouter.post('/owners/:ownerId/credentials', async (req, res) => {
   let actorUserId = null;
   try {
     const actor = await authenticate(req);
-    if (!actor || !(await store.isOperator(actor.userId))) return reply(res, 401, 'FORBIDDEN');
+    if (!authed(actor)) return denied(res, actor);
+    if (!(await store.isOperator(actor.userId))) return reply(res, 401, 'FORBIDDEN');
     actorUserId = actor.userId;
 
     const now = Math.floor(Date.now() / 1000);

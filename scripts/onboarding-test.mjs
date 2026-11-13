@@ -236,11 +236,16 @@ await check('аудитад owner_provisioned бичигдэнэ', async () => {
 // ---- invites: texted to the registered number --------------------------------
 // The token is read out of the message the fake gateway received — exactly
 // where the owner will read it — and never out of an API response.
+// 018: the invite route takes the number typed AGAIN. The test types it
+// right — the registration's own number — except where it means not to.
+const invitePhoneOf = async (id) =>
+  (await query(`select contact_phone from public.owners where id = $1`, [id])).rows[0]?.contact_phone ?? '';
+const inviteBody = async (id) => ({ invitedPhone: await invitePhoneOf(id) });
 const tokenIn = (msg) => /\/invite\/([A-Za-z0-9_-]+)/.exec(msg ?? '')?.[1] ?? null;
 let first;
 let second;
 await check('урилга бүртгэлтэй дугаар руу SMS-ээр очно, хариунд токен БАЙХГҮЙ', async () => {
-  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: {} });
+  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: await inviteBody(ownerId) });
   const msg = smsOut.at(-1);
   first = { token: tokenIn(msg?.text), reference: r.json?.reference };
   const hash = createHash('sha256').update(first.token ?? '', 'utf8').digest();
@@ -263,7 +268,7 @@ await check('урилгын SMS бүртгэгдэнэ, токен бүртгэ�
 });
 
 await check('урилга дахин илгээхэд өмнөх холбоос хүчингүй болно', async () => {
-  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: {} });
+  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: await inviteBody(ownerId) });
   second = { token: tokenIn(smsOut.at(-1)?.text), reference: r.json?.reference };
   const { rows } = await query(
     `select reference, revoked_reason from public.owner_invites where owner_id = $1 order by created_at`,
@@ -271,6 +276,19 @@ await check('урилга дахин илгээхэд өмнөх холбоос 
   );
   return r.json?.status === 'ok' && second.token !== first.token && rows.length === 2 &&
     rows[0].revoked_reason === 'superseded' && rows[1].revoked_reason === null;
+});
+
+await check('дахин бичсэн дугаар нэг оронгоор зөрвөл урилга ИЛГЭЭГДЭХГҮЙ, хуучин холбоос хэвээр', async () => {
+  // 018: the route used to compare the registration's number with itself.
+  const sent = smsOut.length;
+  const r = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: { invitedPhone: '99887767' } });
+  const missing = await call(`/admin/v1/owners/${ownerId}/invite`, { token: op, body: {} });
+  const { rows } = await query(
+    `select count(*)::int n from public.owner_invites where owner_id = $1 and revoked_at is null and accepted_at is null`,
+    [ownerId]
+  );
+  return (r.json?.status === 'phone_mismatch' && missing.json?.status === 'invalid_phone' &&
+    smsOut.length === sent && rows[0].n === 1) || JSON.stringify({ r: r.json, missing: missing.json, open: rows[0].n });
 });
 
 await check('урилгын SMS нэвтрэх кодын лимитэд тооцогдохгүй', async () => {
@@ -386,9 +404,12 @@ const PHONE_OP = randomUUID();
 await check('утсаар бүртгэсэн оператор SMS код авах эрхтэй, танихгүй дугаар авахгүй', async () => {
   await query(`insert into public.operator_phones (phone, label) values ('97699110088','Шинэ оператор')`);
   const { rows } = await query(
-    `select app.phone_may_receive_otp('9911 0088') as op, app.phone_may_receive_otp('99110089') as stranger`
+    `select app.phone_may_receive_otp('97699110088') as op, app.phone_may_receive_otp('99110089') as stranger,
+            app.phone_may_receive_otp('99110088') as alias`
   );
-  return rows[0].op === true && rows[0].stranger === false;
+  // 018: Supabase hands the hook its stored phone, always 976-prefixed for a
+  // real login. The bare 8 digits are how an alias account would be made.
+  return rows[0].op === true && rows[0].stranger === false && rows[0].alias === false;
 });
 
 await check('утас БАТАЛГААЖААГҮЙ бол оператор биш — код хүссэн төдийгөөр эрх олгохгүй', async () => {
@@ -401,6 +422,13 @@ await check('OTP-оор баталгаажсаны дараа консолд о�
   await query(`update auth.users set phone_confirmed_at = now() where id = $1`, [PHONE_OP]);
   const r = await call('/admin/v1/me', { token: await mint(PHONE_OP) });
   return r.status === 200 && r.json?.isOperator === true;
+});
+
+await check('ижил дугаарын 8 оронтой хувилбар (alias) оператор БОЛОХГҮЙ', async () => {
+  const alias = randomUUID();
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'99110088',now())`, [alias]);
+  const r = await call('/admin/v1/me', { token: await mint(alias) });
+  return r.status === 401 || `status ${r.status}`;
 });
 
 await check('утсыг жагсаалтаас хасахад эрх тэр даруй алга болно', async () => {
@@ -421,7 +449,7 @@ await check('SMS-ээр баталгаажсан дугаар дээрх ури�
     body: { ...newOwner, name: 'Холбоосгүй ХХК', contactPhone: '99554433', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
   });
   claimOwner = reg.json?.ownerId;
-  await call(`/admin/v1/owners/${claimOwner}/invite`, { token: op, body: {} });
+  await call(`/admin/v1/owners/${claimOwner}/invite`, { token: op, body: await inviteBody(claimOwner) });
   await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699554433',now())`, [CLAIMER]);
   const r = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(CLAIMER) });
   const m = await query(`select role from public.owner_members where owner_id = $1 and user_id = $2`, [claimOwner, CLAIMER]);
@@ -448,7 +476,7 @@ await check('баталгаажаагүй утас, эсвэл өөр дугаа
     token: op,
     body: { ...newOwner, name: 'Хүлээгч ХХК', contactPhone: '99554400', deviceNo: `D${Math.floor(Math.random() * 1e9)}` },
   });
-  await call(`/admin/v1/owners/${reg.json.ownerId}/invite`, { token: op, body: {} });
+  await call(`/admin/v1/owners/${reg.json.ownerId}/invite`, { token: op, body: await inviteBody(reg.json.ownerId) });
   await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699554400',null)`, [LATE]);
   const unconfirmed = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(LATE) });
   const stranger = await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(IMPOSTOR) });
@@ -472,7 +500,7 @@ await check('нэхэмжлэхийн кодгүйгээр бүртгэж бол
 });
 
 await check('/me кодыг оператор оруулсан эсэхийг хэлнэ (кодыг өөрийг нь биш)', async () => {
-  await call(`/admin/v1/owners/${codelessOwner}/invite`, { token: op, body: {} });
+  await call(`/admin/v1/owners/${codelessOwner}/invite`, { token: op, body: await inviteBody(codelessOwner) });
   await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1,'97699553322',now())`, [CODELESS]);
   await call('/owner/v1/invites/claim', { method: 'POST', token: await mint(CODELESS) });
   const me = await call('/owner/v1/me', { token: await mint(CODELESS) });
@@ -774,6 +802,105 @@ await check('өөр эзэмшигчийн машины алдаа харагд�
 await check('операторын жагсаалтад эзэмшигчийн нэртэй', async () => {
   const r = await call('/admin/v1/faults', { token: op });
   return r.json?.faults?.[0]?.owner_name === 'Шинэ Кофе ХХК' && r.json?.imports?.length >= 1;
+});
+
+// ---- 018: one statement, duplicates in one file ------------------------------------
+await check('нэг файлд ижил алдаа хоёр мөрөнд байсан ч импорт унахгүй, шийдэгдсэн мөр нь ялна', async () => {
+  const when = '2026-09-29T08:00:00+08:00';
+  const r = await call('/admin/v1/faults/import', {
+    token: op,
+    body: { rows: [
+      { deviceNo: DEVICE, code: 'E33', occurredAt: when },
+      { deviceNo: DEVICE, code: 'E33', occurredAt: when, resolvedAt: '2026-09-29T09:00:00+08:00' },
+    ] },
+  });
+  const { rows } = await query(`select resolved_at from public.machine_faults where device_no = $1 and code = 'E33'`, [DEVICE]);
+  return (r.json?.status === 'ok' && rows.length === 1 && rows[0].resolved_at !== null) || JSON.stringify({ r: r.json, rows });
+});
+
+// ---- 018: members, from the console ---------------------------------------------------
+const MEMBER_X = randomUUID();
+await check('оператор бизнесийн гишүүдийг харна (утас нууцлагдсан), оператор биш хүн харахгүй', async () => {
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1, '97699554411', now())`, [MEMBER_X]);
+  await query(`insert into public.owner_members (owner_id, user_id, role) values ($1, $2, 'admin')`, [codelessOwner, MEMBER_X]);
+  const r = await call(`/admin/v1/owners/${codelessOwner}/members`, { token: op });
+  const stranger = await call(`/admin/v1/owners/${codelessOwner}/members`, { token: await mint(MEMBER_X) });
+  const m = r.json?.members?.find((x) => x.userId === MEMBER_X);
+  return (m?.role === 'admin' && m.phoneMasked === '9955••11' && !JSON.stringify(r.json).includes('99554411') &&
+    stranger.status === 401) || JSON.stringify({ r: r.json, stranger: stranger.status });
+});
+
+await check('гишүүнийг хасахад тэр бизнест хандах эрх тэр даруй алга болж, аудитад бичигдэнэ', async () => {
+  const before = await call('/owner/v1/me', { token: await mint(MEMBER_X) });
+  const r = await call(`/admin/v1/owners/${codelessOwner}/members/${MEMBER_X}/remove`, { token: op, body: {} });
+  const after = await call('/owner/v1/me', { token: await mint(MEMBER_X) });
+  const again = await call(`/admin/v1/owners/${codelessOwner}/members/${MEMBER_X}/remove`, { token: op, body: {} });
+  const { rows } = await query(
+    `select count(*)::int n from public.credential_audit where owner_id = $1 and action = 'member_removed'`, [codelessOwner]);
+  return (before.status === 200 && r.json?.status === 'ok' && after.status === 401 && again.json?.status === 'not_found' &&
+    rows[0].n === 1) || JSON.stringify({ before: before.status, r: r.json, after: after.status, again: again.json });
+});
+
+// ---- 018: the operator's emergency stop for one business ---------------------------------
+await check('оператор нэг бизнесийн QPay-г зогсоож, дахин асааж чадна — бусад бизнест нөлөөлөхгүй', async () => {
+  const stop = await call(`/admin/v1/owners/${codelessOwner}/credential-active`, { token: op, body: { active: false } });
+  const off = (await query(`select is_active from public.qpay_credentials where owner_id = $1 and status <> 'pending'`, [codelessOwner])).rows;
+  const others = (await query(`select count(*)::int n from public.qpay_credentials where owner_id <> $1 and is_active`, [codelessOwner])).rows[0].n;
+  const start = await call(`/admin/v1/owners/${codelessOwner}/credential-active`, { token: op, body: { active: true } });
+  const on = (await query(`select is_active from public.qpay_credentials where owner_id = $1 and status <> 'pending'`, [codelessOwner])).rows;
+  const notOp = await call(`/admin/v1/owners/${codelessOwner}/credential-active`, { token: await mint(CODELESS), body: { active: false } });
+  return (stop.json?.status === 'ok' && stop.json.affectedMachines >= 1 && off.every((c) => !c.is_active) && others >= 0 &&
+    start.json?.status === 'ok' && on.some((c) => c.is_active) && notOp.status === 401) ||
+    JSON.stringify({ stop: stop.json, start: start.json, notOp: notOp.status });
+});
+
+// ---- 018: the verify budget, reserved atomically -------------------------------------------
+await check('зэрэг илгээсэн 8 буруу оролдлогоос QPay-д зөвхөн 5 нь хүрнэ (цагийн лимит)', async () => {
+  const RACER = randomUUID();
+  const reg = await call('/admin/v1/owners', { token: op, body: { ...newOwner, name: 'Уралдаан ХХК', contactPhone: '99554422', deviceNo: `D${Math.floor(Math.random() * 1e9)}` } });
+  const racerOwner = reg.json?.ownerId;
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1, '97699554422', now())`, [RACER]);
+  await query(`insert into public.owner_members (owner_id, user_id, role) values ($1, $2, 'admin')`, [racerOwner, RACER]);
+  await query(`select app.touch_step_up($1, 'step_up')`, [RACER]); // this suite runs with the SMS step-up on
+  const cred = (await query(`select id from public.qpay_credentials where owner_id = $1`, [racerOwner])).rows[0].id;
+  const token = await mint(RACER);
+  const before = qpayCalls.token;
+  const rs = await Promise.all(Array.from({ length: 8 }, () =>
+    call('/owner/v1/credentials/verify', { token, body: { credentialId: cred, username: 'racer_merchant', password: 'wrong-pass', invoiceCode: 'RACE_INV' } })));
+  const reached = qpayCalls.token - before;
+  const limited = rs.filter((r) => r.status === 429).length;
+  const { rows } = await query(`select outcome, count(*)::int n from public.credential_verify_attempts where owner_id = $1 group by 1`, [racerOwner]);
+  return (reached === 5 && limited === 3) || JSON.stringify({ reached, limited, rows, codes: rs.map((r) => r.json?.code) });
+});
+
+await check('QPay холбосны дараа БУСАД сессүүд хүчингүй болж, одоогийнх үлдэнэ', async () => {
+  const SESS_USER = randomUUID();
+  const reg = await call('/admin/v1/owners', { token: op, body: { ...newOwner, name: 'Сесс ХХК', contactPhone: '99554433', deviceNo: `D${Math.floor(Math.random() * 1e9)}`, invoiceCode: 'SESS_INV_1' } });
+  const sessOwner = reg.json?.ownerId;
+  await query(`insert into auth.users (id, phone, phone_confirmed_at) values ($1, '97699554433', now())`, [SESS_USER]);
+  await query(`insert into public.owner_members (owner_id, user_id, role) values ($1, $2, 'admin')`, [sessOwner, SESS_USER]);
+  await query(`select app.touch_step_up($1, 'step_up')`, [SESS_USER]);
+  const current = randomUUID();
+  const other = randomUUID();
+  await query(`insert into auth.sessions (id, user_id) values ($1, $3), ($2, $3)`, [current, other, SESS_USER]);
+  await query(`insert into auth.refresh_tokens (user_id, session_id, token) values ($1, $2, 'a'), ($1, $3, 'b')`, [SESS_USER, current, other]);
+  const cred = (await query(`select id from public.qpay_credentials where owner_id = $1`, [sessOwner])).rows[0].id;
+  const token = await new SignJWT({ amr: [{ method: 'otp', timestamp: now() }], session_id: current })
+    .setProtectedHeader({ alg: 'ES256', kid: 'k1' }).setSubject(SESS_USER).setIssuedAt()
+    .setIssuer(`${ISSUER_BASE}/auth/v1`).setAudience('authenticated').setExpirationTime('1h').sign(privateKey);
+  const r = await call('/owner/v1/credentials/verify', { token, body: { credentialId: cred, username: 'sess_merchant', password: 'Sess-Pass-1' } });
+  const left = (await query(`select id from auth.sessions where user_id = $1`, [SESS_USER])).rows.map((x) => x.id);
+  const tokens = (await query(`select session_id, revoked from auth.refresh_tokens where user_id = $1::text order by token`, [SESS_USER])).rows;
+  return (r.json?.ok === true && left.length === 1 && left[0] === current && tokens[0].revoked === false && tokens[1].revoked === true) ||
+    JSON.stringify({ r: r.json, left, tokens });
+});
+
+await check('өөр бизнесийн хуудсаас илгээсэн QPay маягтыг (expectedOwnerId зөрөх) татгалзана', async () => {
+  const r = await call('/owner/v1/credentials/verify', {
+    token: await mint(CODELESS),
+    body: { credentialId: codelessCred, username: 'kodgui_merchant', password: 'Kodgui-Pass-1', invoiceCode: 'KODGUI_INV_1', expectedOwnerId: randomUUID() },
+  });
+  return (r.status === 409 && r.json?.code === 'OWNER_MISMATCH') || JSON.stringify(r.json);
 });
 
 bridge.kill();

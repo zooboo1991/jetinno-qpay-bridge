@@ -154,6 +154,7 @@ const bridge = spawn(
       PUBLIC_URL: `http://localhost:${PORT}`,
       SUPABASE_URL: ISSUER_BASE,
       PORTAL_ORIGIN: 'https://kofe.mn',
+      GUARD_SECRET: 'guard-secret-for-tests-0123456789',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   }
@@ -537,6 +538,57 @@ await check('консол: хугацааны буруу параметр уна
 await check('консол: хугацааны шүүлт — ирээдүйн хугацаанд юу ч алга', async () => {
   const r = await call('/owner/v1/summary?from=2030-01-01&to=2030-01-31', { token: tA });
   return r.status === 200 && r.json?.summary?.amount === 0 && r.json?.summary?.days?.length === 31;
+});
+
+// ---- 018: problems are capped per kind, totals exact --------------------------
+await check('консол: 150 татгалзсан скан ч бусад асуудлыг (needs_human) шахаж гаргахгүй, нийлбэр яг тоо', async () => {
+  await query(
+    `insert into public.ingest_errors (path, device_no, order_no, reason)
+     select '/jetinno/getQrCode', $1, 'R-' || g, 'SALE_REFUSED_CREDENTIAL_INACTIVE' from generate_series(1, 150) g`,
+    [alphaDev]
+  );
+  const r = await call('/owner/v1/problems', { token: tA });
+  const refused = r.json?.summary?.find((x) => x.kind === 'machine_refused');
+  const rows = r.json?.problems ?? [];
+  return (rows.some((p) => p.kind === 'needs_human' && p.reference === 'STUCK-1') &&
+    rows.filter((p) => p.kind === 'machine_refused').length === 100 && refused?.count === 150 && refused?.devices === 1) ||
+    JSON.stringify({ summary: r.json?.summary, n: rows.length });
+});
+
+await check('консол: orders мөр бүрт paid_at (төлөгдсөн цаг), asOf-оос хойшхийг оруулахгүй', async () => {
+  const all = await call('/owner/v1/orders', { token: tA });
+  const paidRow = all.json?.orders?.find((o) => o.status === 'paid');
+  const frozen = await call(`/owner/v1/orders?asOf=${encodeURIComponent('2000-01-01T00:00:00Z')}`, { token: tA });
+  return (paidRow && paidRow.paid_at && frozen.json?.total === 0) || JSON.stringify({ paidRow, frozen: frozen.json?.total });
+});
+
+// ---- 018: the portal's login guard -------------------------------------------------
+const guard = (body, key) =>
+  fetch(`http://localhost:${PORT}/guard/v1/attempt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(key ? { 'x-guard-key': key } : {}) },
+    body: JSON.stringify(body),
+  }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
+const GK = 'guard-secret-for-tests-0123456789';
+
+await check('guard: түлхүүргүй / буруу түлхүүртэй хүсэлт 401', async () => {
+  const a = await guard({ kind: 'otp_request', ip: '203.0.113.9', phone: '99110001' });
+  const b = await guard({ kind: 'otp_request', ip: '203.0.113.9', phone: '99110001' }, 'wrong-key-wrong-key-wrong');
+  return (a.status === 401 && b.status === 401) || `${a.status} ${b.status}`;
+});
+
+await check('guard: нэг IP-ээс 15 минутад 5 SMS код — 6 дахь нь хүлээх хугацаатай татгалзана', async () => {
+  const out = [];
+  for (let i = 0; i < 6; i++) out.push((await guard({ kind: 'otp_request', ip: '203.0.113.10', phone: `9911${1000 + i}` }, GK)).json);
+  const other = (await guard({ kind: 'otp_request', ip: '203.0.113.11', phone: '99111000' }, GK)).json;
+  return (out.slice(0, 5).every((r) => r.allowed === true) && out[5].allowed === false && out[5].retryAfterSeconds > 0 &&
+    other.allowed === true) || JSON.stringify(out);
+});
+
+await check('guard: нэг утсанд олон IP-ээс нууц үг таахыг цагт 20-оор зогсооно', async () => {
+  const out = [];
+  for (let i = 0; i < 21; i++) out.push((await guard({ kind: 'password', ip: `198.51.100.${i + 1}`, phone: '99110777' }, GK)).json.allowed);
+  return (out.slice(0, 20).every(Boolean) && out[20] === false) || JSON.stringify(out);
 });
 
 bridge.kill('SIGTERM');

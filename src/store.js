@@ -1,4 +1,4 @@
-import { query } from './db.js';
+import { query, tx } from './db.js';
 
 /**
  * One thin function per statement. No transactions.
@@ -30,6 +30,8 @@ export async function resolveMachine(deviceNo) {
             o.status        as owner_status,
             c.sealed,
             c.key_id,
+            c.fingerprint     as credential_fingerprint,
+            c.auth_fail_count as credential_auth_fail_count,
             c.status        as credential_status,
             c.is_active     as credential_active,
             c.updated_at    as credential_updated_at
@@ -84,6 +86,79 @@ export async function beginOrder(o) {
   );
   return rows[0] ?? null;
 }
+
+/**
+ * The order, written once and complete: invoice attached, status
+ * awaiting_payment, after the invoice exists.
+ *
+ * beginOrder + attachInvoice wrote it in two steps AFTER the QR was already
+ * on the screen. A restart or a failed second statement in between left a
+ * 'creating' row that every recovery path skips — and the customer who then
+ * paid had no order anywhere. One statement has no in-between.
+ *
+ * source 'env' is the operator's own merchant (a machine nobody registered):
+ * no owner, machine or credential. Returns the row id, whether this call
+ * inserted it or an equal row already existed.
+ */
+export async function insertOrder(o) {
+  const { rows } = await query(
+    `insert into public.orders (
+       source, machine_id, owner_id, qpay_credential_id, merchant_fp,
+       order_no, device_no, notify_url,
+       product_id, product_name,
+       raw_order_amount, amount_divisor, amount_mnt,
+       qpay_sender_invoice_no, callback_url,
+       qpay_invoice_id, qr_code, qr_text_len,
+       status, expires_at
+     ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'awaiting_payment',
+               now() + make_interval(secs => $19))
+     on conflict do nothing
+     returning id`,
+    [
+      o.source,
+      o.machineId ?? null,
+      o.ownerId ?? null,
+      o.credentialId ?? null,
+      o.merchantFp ?? null,
+      o.orderNo,
+      o.deviceNo,
+      o.notifyUrl,
+      o.productId ?? null,
+      o.productName ?? null,
+      o.rawOrderAmount,
+      o.amountDivisor,
+      o.amountMnt,
+      o.senderInvoiceNo,
+      o.callbackUrl,
+      o.invoiceId,
+      o.qrCode,
+      o.qrTextLen ?? null,
+      Math.round((o.abandonAfterMs ?? 600_000) / 1000),
+    ]
+  );
+  if (rows[0]?.id) return rows[0].id;
+  return findOrderIdByDevice(o.deviceNo, o.orderNo, o.invoiceId);
+}
+
+/**
+ * An order's id by the machine's own identifiers. orderNo is unique per
+ * machine only; the invoice id, when known, pins the exact row.
+ */
+export async function findOrderIdByDevice(deviceNo, orderNo, invoiceId) {
+  const { rows } = await query(
+    `select o.id from public.orders o
+      where o.device_no = $1 and o.order_no = $2
+        and ($3::text is null or o.qpay_invoice_id = $3)
+      order by o.created_at desc
+      limit 1`,
+    [deviceNo, orderNo, invoiceId ?? null]
+  );
+  return rows[0]?.id ?? null;
+}
+
+/** The state that decides what a refused claim meant. */
+export const orderState = (orderId) =>
+  one(`select status, notify_sent_at, product_done_at, payment_confirmed_at from public.orders where id = $1`, [orderId]);
 
 export async function findOrderByMachine(machineId, orderNo) {
   const { rows } = await query(
@@ -153,7 +228,7 @@ export const markPaymentConfirmed = (orderId, { paymentId, paidAmountMnt, leaseS
 /** A credential row by id, for rebuilding an order's QPay client on rehydrate. */
 export async function getCredentialById(credentialId) {
   const { rows } = await query(
-    `select c.id, c.owner_id, c.sealed, c.key_id, c.status, c.is_active
+    `select c.id, c.owner_id, c.sealed, c.key_id, c.status, c.is_active, c.fingerprint
        from public.qpay_credentials c
       where c.id = $1`,
     [credentialId]
@@ -170,6 +245,19 @@ export async function getCredentialById(credentialId) {
  * stay finished, and a 'creating' row has no invoice to check against.
  * orderNo is only unique per machine, so ties go to the newest row.
  */
+export async function findLiveOrderByDevice(deviceNo, orderNo) {
+  const { rows } = await query(
+    `select o.* from public.orders o
+      where o.device_no = $1 and o.order_no = $2
+        and o.status in ('awaiting_payment','settling','payment_confirmed')
+        and o.qpay_invoice_id is not null
+      order by o.created_at desc
+      limit 1`,
+    [deviceNo, orderNo]
+  );
+  return rows[0] ?? null;
+}
+
 export async function findLiveOrder(orderNo) {
   const { rows } = await query(
     `select o.* from public.orders o
@@ -200,8 +288,11 @@ export async function giveUpExhausted() {
 
 export const markNotifySent = (orderId) => one(`select * from app.mark_notify_sent($1)`, [orderId]);
 export const finishSettle = (orderId) => one(`select * from app.finish_settle($1)`, [orderId]);
-export const releaseSettle = (orderId, error) =>
-  one(`select * from app.release_settle($1, $2)`, [orderId, error ?? null]);
+export const releaseSettle = (orderId, error, countAttempt = true) =>
+  one(`select * from app.release_settle($1, $2, $3)`, [orderId, error ?? null, countAttempt]);
+/** After the machine REFUSED the notify: retryable at once, not after the grace window (018). */
+export const releaseSettleUndelivered = (orderId, error) =>
+  one(`select * from app.release_settle_undelivered($1, $2)`, [orderId, error ?? null]);
 export const giveUp = (orderId, error) =>
   one(`select * from app.give_up($1, $2)`, [orderId, error ?? null]);
 export const markCancelled = (orderId) => one(`select * from app.mark_cancelled($1)`, [orderId]);
@@ -221,6 +312,17 @@ export async function ownerStats(ownerId, { timezone, now } = {}) {
     [ownerId, timezone ?? null, now ?? null]
   );
   return rows[0]?.stats ?? null;
+}
+
+/** Money confirmed, machine not told (or told and never answered past the grace window). */
+export async function claimUnnotified({ limit, leaseSeconds, instance, notifyGraceSeconds } = {}) {
+  const { rows } = await query(`select * from app.claim_unnotified_orders($1, $2, $3, $4)`, [
+    limit ?? 20,
+    leaseSeconds ?? 60,
+    instance ?? null,
+    notifyGraceSeconds ?? 120,
+  ]);
+  return rows;
 }
 
 export async function claimAbandoned({ limit, leaseSeconds, instance } = {}) {
@@ -357,6 +459,40 @@ export async function credentialVerifyBudget(ownerId, usernameFp, limits = {}) {
   return rows[0] ?? { out_allowed: false, out_reason: 'UNAVAILABLE', out_retry_minutes: 60 };
 }
 
+/**
+ * The budget, reserved atomically (018): decides and records a 'pending'
+ * attempt under a per-owner lock, so parallel requests cannot all pass it.
+ * finishVerifyAttempt writes the real outcome once QPay has answered.
+ */
+export async function reserveVerifyAttempt(
+  { ownerId, credentialId, actorUserId, usernameFp, remoteIp, userAgent },
+  limits = {}
+) {
+  const { rows } = await query(
+    `select * from app.reserve_verify_attempt($1,$2,$3,$4,$5::inet,$6,$7,$8,$9,$10,$11,$12)`,
+    [
+      ownerId,
+      credentialId,
+      actorUserId,
+      usernameFp,
+      remoteIp ?? null,
+      userAgent ?? null,
+      limits.perHour ?? 5,
+      limits.perDay ?? 20,
+      limits.distinctUsernamesPerDay ?? 2,
+      limits.lockFails ?? 5,
+      limits.lockMinutes ?? 60,
+      limits.globalAuthFailsPer10Min ?? 50,
+    ]
+  );
+  return rows[0] ?? { out_allowed: false, out_reason: 'UNAVAILABLE', out_retry_minutes: 60, out_attempt_id: null };
+}
+
+export async function finishVerifyAttempt(attemptId, outcome) {
+  if (!attemptId) return;
+  await query(`select app.finish_verify_attempt($1, $2)`, [attemptId, outcome]);
+}
+
 export async function recordVerifyAttempt({
   ownerId,
   credentialId,
@@ -402,16 +538,23 @@ export async function recordVerifyFailure(credentialId, actorUserId, failureCode
  * before an owner's revenue moves.
  */
 export async function usernameFpEverConfigured(ownerId, usernameFp) {
+  // The ledger, not qpay_credentials: the credential's fingerprint is taken
+  // over username AND invoice code, the attempt's over the username alone,
+  // so comparing the two never matched — and every typo paged the operator.
   const { rows } = await query(
     `select exists (
-       select 1 from public.qpay_credentials c
-        where c.owner_id = $1
-          and (c.fingerprint = $2 or c.pending_fingerprint = $2)
+       select 1 from public.credential_verify_attempts a
+        where a.owner_id = $1 and a.username_fp = $2 and a.outcome = 'ok'
      ) as seen`,
     [ownerId, usernameFp]
   );
   return rows[0]?.seen ?? false;
 }
+
+/** A live merchant failing on the sale path, and recovering (018). */
+export const noteSaleAuthFailure = (credentialId, code) =>
+  query(`select app.note_sale_auth_failure($1, $2)`, [credentialId, code ?? null]);
+export const noteSaleOk = (credentialId) => query(`select app.note_sale_ok($1)`, [credentialId]);
 
 /** Stages the sealed candidate in pending_*; the live credential keeps serving. */
 export async function beginCredentialVerification({
@@ -516,7 +659,10 @@ export async function credentialForOwner(credentialId, actorUserId) {
 /** Staged verifications past their TTL, for the sweeper to abort. */
 export async function expiredVerifications(limit = 20) {
   const { rows } = await query(
-    `select c.id, c.owner_id, c.verify_invoice_id
+    // pending_sealed is read here, while it still exists: the abort that
+    // follows clears it, and without it the probe invoice cannot be
+    // cancelled — so it never was.
+    `select c.id, c.owner_id, c.verify_invoice_id, c.pending_sealed
        from public.qpay_credentials c
       where c.verify_expires_at is not null
         and c.verify_expires_at < now()
@@ -527,15 +673,23 @@ export async function expiredVerifications(limit = 20) {
   return rows;
 }
 
+/** The staged candidate's blob, read before an abort or confirm clears it. */
+export async function pendingSealed(credentialId) {
+  const { rows } = await query(`select c.pending_sealed from public.qpay_credentials c where c.id = $1`, [credentialId]);
+  return rows[0]?.pending_sealed ?? null;
+}
+
 /**
  * Append-only note on a credential's timeline, for events with no SQL
  * function of their own — a verification invoice that could not be cancelled,
  * for instance. Never carries a secret: the caller passes named scalars.
  */
 export async function logCredentialEvent(credentialId, action, detail = {}) {
+  // actor_kind is NOT NULL and the action must be one the table's check
+  // knows: this insert used to violate both, and every event was lost.
   await query(
-    `insert into public.credential_audit (credential_id, owner_id, action, detail)
-     select $1, c.owner_id, $2, $3::jsonb
+    `insert into public.credential_audit (credential_id, owner_id, action, actor_kind, detail)
+     select $1, c.owner_id, $2, 'system', $3::jsonb
        from public.qpay_credentials c where c.id = $1`,
     [credentialId, action, JSON.stringify(detail)]
   );
@@ -549,8 +703,21 @@ export async function logCredentialEvent(credentialId, action, detail = {}) {
  * schema is not reachable the change still stands — this is defence after the
  * fact, not the gate — so a failure is swallowed by the caller.
  */
-export async function revokeOtherSessions(userId) {
-  await query(`update auth.refresh_tokens set revoked = true where user_id = $1::text`, [userId]);
+export async function revokeOtherSessions(userId, keepSessionId) {
+  // OTHER sessions: the one that just made the change stays signed in. It
+  // was revoked too, and the owner was thrown out within the hour of
+  // connecting QPay. Deleting the session rows also stops their push
+  // subscriptions (018 session_alive), which revoking tokens alone did not.
+  // A token without a session id (none is) leaves nothing to spare.
+  await query(
+    `update auth.refresh_tokens set revoked = true
+      where user_id = $1::text and session_id is distinct from $2::uuid`,
+    [userId, keepSessionId ?? null]
+  );
+  await query(`delete from auth.sessions where user_id = $1::uuid and id is distinct from $2::uuid`, [
+    userId,
+    keepSessionId ?? null,
+  ]);
 }
 
 /** The number on the sales paperwork — the one a credential-change alert goes to. */
@@ -746,6 +913,12 @@ export async function ownerProblems(ownerId) {
   return rows;
 }
 
+/** Exact per-kind totals over the same windows the list uses (018). */
+export async function ownerProblemSummary(ownerId) {
+  const { rows } = await query(`select * from app.owner_problem_summary($1)`, [ownerId]);
+  return rows;
+}
+
 /** Migration 011: invite texts sent to this number in the last day. */
 export async function inviteSmsCount24h(phone) {
   const { rows } = await query(
@@ -763,10 +936,15 @@ export async function recordSmsSend(phone, purpose, ok, status, error, reply) {
 
 /** Migration 015: machine faults exported from Jetinno's SaaS. */
 export async function operatorImportFaults(actorUserId, fileName, rows) {
-  const { rows: r } = await query(`select * from app.operator_import_faults($1,$2,$3::jsonb)`, [
-    actorUserId, fileName ?? null, JSON.stringify(rows),
-  ]);
-  return r[0] ?? { out_status: 'error' };
+  // Its own transaction with its own timeout: a month's export is thousands
+  // of rows, and the pool-wide 800 ms is sized for the machine path.
+  return tx(async (q) => {
+    await q(`set local statement_timeout = '30s'`);
+    const { rows: r } = await q(`select * from app.operator_import_faults($1,$2,$3::jsonb)`, [
+      actorUserId, fileName ?? null, JSON.stringify(rows),
+    ]);
+    return r[0] ?? { out_status: 'error' };
+  });
 }
 
 export async function operatorFaults(actorUserId, limit) {
@@ -808,16 +986,13 @@ export async function touchMachineSeen(deviceNo) {
  * with it: the endpoint is the browser's, and it now belongs to whoever is
  * signed in on it.
  */
-export async function savePushSubscription(userId, { endpoint, p256dh, auth, notifySales }) {
-  return one(
-    `insert into public.push_subscriptions (user_id, endpoint, p256dh, auth, notify_sales)
-     values ($1, $2, $3, $4, $5)
-     on conflict (endpoint) do update
-       set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
-           notify_sales = excluded.notify_sales
-     returning notify_sales`,
-    [userId, endpoint, p256dh, auth, notifySales]
-  );
+export async function savePushSubscription(userId, { endpoint, p256dh, auth, notifySales, sessionId }) {
+  // 018: remembers the session (a signed-out device stops receiving) and
+  // keeps at most ten devices per person.
+  const row = await one(`select * from app.save_push_subscription($1, $2, $3, $4, $5, $6::uuid)`, [
+    userId, endpoint, p256dh, auth, notifySales, sessionId ?? null,
+  ]);
+  return row ? { notify_sales: row.out_notify_sales } : null;
 }
 
 export async function deletePushSubscription(userId, endpoint) {
@@ -847,7 +1022,7 @@ export async function saleSubscriptions(ownerId) {
     `select distinct ${SUB_COLUMNS}
        from public.push_subscriptions s
        join public.owner_members m on m.user_id = s.user_id
-      where m.owner_id = $1 and s.notify_sales`,
+      where m.owner_id = $1 and s.notify_sales and app.session_alive(s.session_id)`,
     [ownerId]
   );
   return rows;
@@ -859,14 +1034,17 @@ export async function ownerSubscriptions(ownerIds) {
     `select distinct ${SUB_COLUMNS}
        from public.push_subscriptions s
        join public.owner_members m on m.user_id = s.user_id
-      where m.owner_id = any ($1::uuid[])`,
+      where m.owner_id = any ($1::uuid[]) and app.session_alive(s.session_id)`,
     [ownerIds]
   );
   return rows;
 }
 
 export async function userSubscriptions(userId) {
-  const { rows } = await query(`select ${SUB_COLUMNS} from public.push_subscriptions s where s.user_id = $1`, [userId]);
+  const { rows } = await query(
+    `select ${SUB_COLUMNS} from public.push_subscriptions s where s.user_id = $1 and app.session_alive(s.session_id)`,
+    [userId]
+  );
   return rows;
 }
 
@@ -963,4 +1141,58 @@ export async function markNotificationsSeen(ownerId, userId) {
      on conflict (user_id, owner_id) do update set seen_at = now()`,
     [userId, ownerId]
   );
+}
+
+// ---------------------------------------------------------------------------
+// Members, from the operator's console (018). The operator check is in SQL.
+// ---------------------------------------------------------------------------
+export async function operatorOwnerMembers(actorUserId, ownerId) {
+  const { rows } = await query(`select * from app.operator_owner_members($1, $2)`, [actorUserId, ownerId]);
+  return rows;
+}
+
+export async function operatorRemoveMember(actorUserId, ownerId, userId) {
+  const { rows } = await query(`select app.operator_remove_member($1, $2, $3) as status`, [actorUserId, ownerId, userId]);
+  return rows[0]?.status ?? 'error';
+}
+
+/** The operator's emergency stop for one business's QPay (018). */
+export async function operatorSetCredentialActive(actorUserId, ownerId, active) {
+  const { rows } = await query(`select * from app.operator_set_credential_active($1, $2, $3)`, [
+    actorUserId, ownerId, active,
+  ]);
+  return rows[0] ?? { out_status: 'error', out_credential_id: null, out_affected_machines: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// The portal's auth guard (018): one ledger row per allowed attempt.
+// ---------------------------------------------------------------------------
+export async function authAttempt(kind, ip, phone) {
+  const { rows } = await query(`select * from app.auth_attempt($1, $2::inet, $3)`, [kind, ip ?? null, phone ?? null]);
+  return rows[0] ?? { out_allowed: true, out_retry_seconds: 0 };
+}
+
+export const pruneAuthAttempts = () => query(`select app.prune_auth_attempts()`);
+
+// ---------------------------------------------------------------------------
+// Boot-time checks.
+// ---------------------------------------------------------------------------
+/** Machines whose recorded divisor disagrees with the one the bridge prices by. */
+export async function divisorMismatches(divisor) {
+  const { rows } = await query(
+    `select count(*)::int n from public.machines m where m.status = 'active' and m.amount_divisor <> $1`,
+    [divisor]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+/** One active credential per sealing key, to prove the keyring opens them. */
+export async function credentialPerKey() {
+  const { rows } = await query(
+    `select distinct on (c.key_id) c.id, c.owner_id, c.key_id, c.sealed
+       from public.qpay_credentials c
+      where c.is_active and c.sealed is not null
+      order by c.key_id, c.updated_at desc`
+  );
+  return rows;
 }
