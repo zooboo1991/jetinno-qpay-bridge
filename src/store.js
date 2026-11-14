@@ -227,6 +227,26 @@ export const markPaymentConfirmed = (orderId, { paymentId, paidAmountMnt, leaseS
     leaseSeconds ?? 60,
   ]);
 
+/**
+ * The house's credential (house.js): the business's active QPay credential,
+ * the one most of its active machines sell on (newest on a tie). A business
+ * that is not active takes no money, the operator's included.
+ */
+export async function houseCredential(ownerId) {
+  const { rows } = await query(
+    `select c.id, c.owner_id, c.sealed, c.fingerprint
+       from public.qpay_credentials c
+       join public.owners o on o.id = c.owner_id
+      where c.owner_id = $1 and c.is_active and c.sealed is not null and o.status = 'active'
+      order by (select count(*) from public.machines m
+                 where m.qpay_credential_id = c.id and m.status = 'active') desc,
+               c.updated_at desc
+      limit 1`,
+    [ownerId]
+  );
+  return rows[0] ?? null;
+}
+
 /** A credential row by id, for rebuilding an order's QPay client on rehydrate. */
 export async function getCredentialById(credentialId) {
   const { rows } = await query(
@@ -1218,15 +1238,20 @@ export async function billingHistory(ownerId, limit = 24) {
   return rows;
 }
 
-/** The newest open QPay invoice under a day old, optionally for a number of months. */
-export async function openBillingInvoice(ownerId, months = null) {
+/**
+ * The newest open QPay invoice under a day old, issued by `merchant` (020: a
+ * house marker, or null for the env account). One from another merchant —
+ * made before the operator's account changed — is never shown again: paying
+ * it would put the money in the old account. Its callback still credits it.
+ */
+export async function openBillingInvoice(ownerId, merchant = null) {
   return one(
     `select * from public.billing_invoices
       where owner_id = $1 and source = 'qpay' and status = 'open' and qpay_invoice_id is not null
         and created_at > now() - interval '24 hours'
-        and ($2::int is null or months = $2)
+        and merchant is not distinct from $2
       order by created_at desc limit 1`,
-    [ownerId, months]
+    [ownerId, merchant]
   );
 }
 
@@ -1239,11 +1264,11 @@ export async function billingInvoicesLastHour(ownerId) {
   return rows[0]?.n ?? 0;
 }
 
-export const insertBillingInvoice = ({ ownerId, months, machines, feePerMachine, amount, createdBy }) =>
+export const insertBillingInvoice = ({ ownerId, months, machines, feePerMachine, amount, createdBy, merchant }) =>
   one(
-    `insert into public.billing_invoices (owner_id, months, machines, fee_per_machine_mnt, amount_mnt, source, created_by)
-     values ($1, $2, $3, $4, $5, 'qpay', $6) returning id`,
-    [ownerId, months, machines, feePerMachine, amount, createdBy ?? null]
+    `insert into public.billing_invoices (owner_id, months, machines, fee_per_machine_mnt, amount_mnt, source, created_by, merchant)
+     values ($1, $2, $3, $4, $5, 'qpay', $6, $7) returning id`,
+    [ownerId, months, machines, feePerMachine, amount, createdBy ?? null, merchant ?? null]
   );
 
 export const attachBillingQpay = (id, { invoiceId, senderInvoiceNo, qrText, qrImage, shortUrl, urls }) =>

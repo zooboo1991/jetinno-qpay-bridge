@@ -37,7 +37,8 @@ services:
 
       # --- The operator's own QPay merchant. Still required after per-owner
       #     credentials work: it is the fallback for unregistered machines and
-      #     for a database outage. ---
+      #     for a database outage, and it settles what it issued before
+      #     OPERATOR_MERCHANT_OWNER_ID was set. ---
       - key: QPAY_USERNAME
         sync: false
       - key: QPAY_PASSWORD
@@ -109,6 +110,14 @@ services:
       #     Missing on either side, logins work exactly as before, unguarded.
       #     At least 16 characters. ---
       - key: GUARD_SECRET
+        sync: false
+
+      # --- The operator's money on a business's own QPay (020): the system
+      #     subscription and every unregistered machine's sale. The value is
+      #     that business's id — not a secret, but not for this public repo.
+      #     Unset: the QPAY_* account above. Set but unusable: refused, never
+      #     the QPAY_* account in its place. /health says which, as `house`. ---
+      - key: OPERATOR_MERCHANT_OWNER_ID
         sync: false
 
       # Deliberately absent: QPAY_MOCK, ALLOW_PRIVATE_NOTIFY and

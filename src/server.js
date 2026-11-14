@@ -13,6 +13,7 @@ import * as alerts from './alerts.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
 import { guardApi, guardConfigured } from './guard.js';
 import * as billing from './billing.js';
+import * as house from './house.js';
 import { pushConfigured, pushSale } from './push.js';
 import { open, credentialAad } from './crypto.js';
 import { createHmac, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
@@ -348,7 +349,7 @@ async function merchantFor(deviceNo, orderNo) {
     dw('ingestError', () =>
       store.logIngestError({ path: '/jetinno/getQrCode', deviceNo, orderNo, reason: 'DEVICE_NOT_REGISTERED' })
     );
-    return { client: null, source: 'env-unregistered' };
+    return operatorMerchant(deviceNo, orderNo);
   }
 
   const blocked =
@@ -395,6 +396,30 @@ async function merchantFor(deviceNo, orderNo) {
     );
     return { refused: 'CREDENTIAL_UNSEAL_FAILED', machine };
   }
+}
+
+/**
+ * The merchant for a machine nobody has registered: the house business's
+ * account when OPERATOR_MERCHANT_OWNER_ID names one (house.js), otherwise
+ * the env QPAY_* account. A house that cannot be used refuses the sale —
+ * never the env account in its place: that may be somebody's test merchant,
+ * and a refused cup is an apology where a misrouted one is a dispute.
+ */
+async function operatorMerchant(deviceNo, orderNo) {
+  let h;
+  try {
+    h = await house.houseMerchant();
+  } catch (err) {
+    const reason = `SALE_REFUSED_${err.code ?? 'OPERATOR_MERCHANT_UNAVAILABLE'}`.slice(0, 80);
+    log('sale refused', deviceNo, reason);
+    dw('ingestError', () => store.logIngestError({ path: '/jetinno/getQrCode', deviceNo, orderNo, reason }));
+    house.reportDown(err, log);
+    return { refused: reason };
+  }
+  if (!h) return { client: null, source: 'env-unregistered' };
+  // The order row stays an env row (no machine, owner or credential of its
+  // own); the marker on it names the house credential that issued it.
+  return { client: MOCK ? null : h.client, source: 'house', marker: h.marker };
 }
 
 app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
@@ -471,7 +496,9 @@ app.post('/jetinno/getQrCode', jetinnoBody, async (req, res) => {
     machineId: merchant.machine?.machine_id ?? null,
     ownerId: merchant.machine?.owner_id ?? null,
     credentialId: merchant.machine?.qpay_credential_id ?? null,
-    merchantFp: merchant.machine?.credential_fingerprint ?? null,
+    // Owner rows: the credential's fingerprint. Env rows: the house marker,
+    // or null for the env account.
+    merchantFp: merchant.machine?.credential_fingerprint ?? merchant.marker ?? null,
     pgId: null,
   };
   // A function-valued property: JSON.stringify skips it, so the debug /orders
@@ -803,26 +830,20 @@ function orderFromRow(row) {
 }
 
 /**
- * The client that can check or cancel this row's invoice: the operator's own
- * merchant for an env order, otherwise the credential snapshotted on the row
- * — rebuilt even if since deactivated (settling an existing sale is not a new
- * sale), but only while it still names the merchant that issued the invoice.
+ * The client that can check or cancel this row's invoice: for an env order,
+ * the env account — or the house credential its marker names; otherwise the
+ * credential snapshotted on the row — rebuilt even if since deactivated
+ * (settling an existing sale is not a new sale), but only while it still
+ * names the merchant that issued the invoice.
  */
 async function clientForRow(row) {
   if (MOCK) return { client: null };
-  if (row.source === 'env' || !row.qpay_credential_id) return { client: null };
-  const cred = await store.getCredentialById(row.qpay_credential_id);
-  if (!cred?.sealed) return { error: 'CREDENTIAL_MISSING' };
-  if (row.merchant_fp && cred.fingerprint && cred.fingerprint !== row.merchant_fp) return { error: 'MERCHANT_CHANGED' };
-  try {
-    const plain = open(cred.sealed, {
-      context: credentialAad({ credentialId: row.qpay_credential_id, ownerId: cred.owner_id }),
-    });
-    return { client: qpay.clientForSealed(plain, row.qpay_credential_id) };
-  } catch (err) {
-    log('credential unseal failed for order', row.order_no, firstLine(err));
-    return { error: 'CREDENTIAL_UNSEAL_FAILED' };
-  }
+  const r =
+    row.source === 'env' || !row.qpay_credential_id
+      ? await house.issuerClient(row.merchant_fp)
+      : await house.clientForCredential(row.qpay_credential_id, row.merchant_fp);
+  if (r.error === 'CREDENTIAL_UNSEAL_FAILED') log('credential unseal failed for order', row.order_no, r.detail);
+  return r;
 }
 
 /*
@@ -1363,7 +1384,10 @@ app.get('/orders/:orderNo', (req, res) => {
  * or cookie) the full picture comes back as before.
  */
 app.get('/health', (req, res) => {
-  const pub = { ok: true, push: pushConfigured(), db: DUAL_WRITE };
+  // `house`: which account takes the operator's money — 'unset' (the env
+  // one), 'ok', or why the configured house cannot (house.js). A state word,
+  // never an id.
+  const pub = { ok: true, push: pushConfigured(), db: DUAL_WRITE, house: house.status() };
   if (!debugAllowed(req)) return res.json(pub);
   res.json({
     ...pub,
@@ -1693,6 +1717,20 @@ if (DUAL_WRITE && !MOCK) {
         }
       } catch (err) {
         keyringStatus = { error: firstLine(err) };
+      }
+      // The house (OPERATOR_MERCHANT_OWNER_ID): a wrong id or a business
+      // with no connected QPay stops the subscription and every unregistered
+      // machine's sale. Said at boot, and in /health as `house`.
+      if (house.houseConfigured()) {
+        try {
+          await house.houseMerchant();
+          log('operator merchant: the house business\'s QPay account');
+        } catch (err) {
+          log('OPERATOR MERCHANT UNUSABLE', err.code ?? firstLine(err));
+          house.reportDown(err, log);
+        }
+      } else {
+        log('operator merchant: env QPAY_* account (OPERATOR_MERCHANT_OWNER_ID unset)');
       }
       try {
         const n = await store.divisorMismatches(AMOUNT_DIVISOR);

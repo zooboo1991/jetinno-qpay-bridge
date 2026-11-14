@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import * as store from './store.js';
 import * as qpay from './qpay.js';
 import * as owners from './owners.js';
+import * as house from './house.js';
 import { pushToOwners } from './push.js';
 import { sendSms, smsConfigured, localNumber } from './sms.js';
 
@@ -9,8 +10,11 @@ import { sendSms, smsConfigured, localNumber } from './sms.js';
  * The system subscription (migration 019).
  *
  * Every business pays BILLING_FEE_PER_MACHINE_MNT a month for each active
- * machine, through QPay on the OPERATOR's own merchant (the env QPAY_*
- * account — the same one an unregistered machine sells on). Each payment
+ * machine, through QPay on the OPERATOR's own merchant: the house business's
+ * connected account when OPERATOR_MERCHANT_OWNER_ID names one (house.js),
+ * the env QPAY_* account otherwise. Each invoice records which of them issued
+ * it (020) and is checked there, so a change of account never strands an
+ * open invoice. Each payment
  * extends owners.paid_until by the months bought. BILLING_GRACE_DAYS after
  * it lapses the business is suspended: its machines refuse QPay sales and
  * its portal shows only the billing page, until a payment lands.
@@ -85,13 +89,16 @@ function invoiceView(row) {
 export async function billingFor(ownerId, { autoCheck = true, log = () => {} } = {}) {
   const b = await store.ownerBilling(ownerId, BILLING);
   if (!b) return null;
-  let open = await store.openBillingInvoice(ownerId);
+  // Only an invoice of the account that takes payments NOW is shown. While
+  // that account cannot be reached none is, and «Төлөх» says so.
+  const merchant = await house.currentMarker().catch(() => undefined);
+  let open = merchant === undefined ? null : await store.openBillingInvoice(ownerId, merchant);
   // Back from the bank app with the page reloaded: the payment is usually
   // there before QPay's callback is. Checked at most every 20 s per invoice.
   if (open && autoCheck && checkable(open.id)) {
     const r = await checkInvoice(open.id, { log }).catch(() => null);
     if (r?.status === 'paid') return billingFor(ownerId, { autoCheck: false, log });
-    open = await store.openBillingInvoice(ownerId);
+    open = await store.openBillingInvoice(ownerId, merchant);
   }
   const billable = b.out_state !== 'exempt' && b.out_state !== 'no_machines';
   const history = await store.billingHistory(ownerId);
@@ -148,24 +155,35 @@ export async function createInvoice(ownerId, months, userId, log = () => {}) {
   if (b.out_state === 'exempt' || b.out_state === 'no_machines' || b.out_monthly_fee <= 0) {
     throw new BillingError('NOTHING_TO_BILL', 409);
   }
-  // Only the NEWEST open invoice is reused, and only for the same months and
-  // amount: it is the one the billing page shows, so handing back an older
-  // one would put a different invoice on the screen than the one asked for.
-  const newest = await store.openBillingInvoice(ownerId);
+  // The account the money goes to. A house that cannot be used makes no
+  // invoice at all — never one on the env account in its place.
+  let issuer;
+  try {
+    issuer = await house.houseMerchant();
+  } catch (err) {
+    house.reportDown(err, log);
+    throw new BillingError('UNAVAILABLE', 503);
+  }
+  const merchant = issuer?.marker ?? null;
+  // Only the NEWEST open invoice is reused, and only for the same months,
+  // amount and merchant: it is the one the billing page shows, so handing
+  // back another would put a different invoice on the screen than the one
+  // asked for.
+  const newest = await store.openBillingInvoice(ownerId, merchant);
   if (newest && newest.months === months && newest.amount_mnt === b.out_monthly_fee * months) return invoiceView(newest);
   // A button that creates invoices on somebody else's merchant account.
   if ((await store.billingInvoicesLastHour(ownerId)) >= 10) throw new BillingError('RATE_LIMITED', 429);
 
   const amount = b.out_monthly_fee * months;
   const row = await store.insertBillingInvoice({
-    ownerId, months, machines: b.out_machines, feePerMachine: b.out_fee_per_machine, amount, createdBy: userId,
+    ownerId, months, machines: b.out_machines, feePerMachine: b.out_fee_per_machine, amount, createdBy: userId, merchant,
   });
   // Unique for the operator's merchant forever, and never shaped like a
   // sale's orderNo or a credential probe's.
   const senderInvoiceNo = `bill-${row.id.replace(/-/g, '').slice(0, 12)}-${Date.now()}`;
   let invoice;
   try {
-    invoice = await qpay.createInvoice({
+    invoice = await (issuer?.client ?? qpay).createInvoice({
       senderInvoiceNo,
       amount,
       description: `Coffeine систем ${months} сар · ${b.out_machines} машин`,
@@ -200,7 +218,14 @@ export async function checkInvoice(invoiceId, { log = () => {} } = {}) {
     return { status: 'paid', paidUntil: iso(b?.out_paid_until), ownerId: row.owner_id, already: true };
   }
   if (!row.qpay_invoice_id) return { status: row.status, ownerId: row.owner_id };
-  const { paid, paymentId, amount } = await qpay.checkPayment(row.qpay_invoice_id);
+  // Asked of the account that issued it: before the switch the env one.
+  const issuer = await house.issuerClient(row.merchant);
+  if (issuer.error) {
+    log('billing check: issuing merchant unusable', row.id, issuer.error);
+    house.reportDown({ code: `BILLING_ISSUER_${issuer.error}` }, log);
+    return { status: row.status, ownerId: row.owner_id };
+  }
+  const { paid, paymentId, amount } = await (issuer.client ?? qpay).checkPayment(row.qpay_invoice_id);
   if (!paid) {
     const b = await store.ownerBilling(row.owner_id, BILLING);
     return { status: row.status, paidUntil: iso(b?.out_paid_until), ownerId: row.owner_id };

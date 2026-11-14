@@ -1,4 +1,5 @@
 import * as store from './store.js';
+import { forget as forgetHouse } from './house.js';
 
 /**
  * A short-lived cache in front of the device → owner → credential lookup.
@@ -74,6 +75,9 @@ export function forgetCredential(credentialId) {
   for (const [deviceNo, entry] of byDevice) {
     if (entry.row?.qpay_credential_id === credentialId) byDevice.delete(deviceNo);
   }
+  // The house's cached credential (house.js) goes too: any credential change
+  // may be the house's, and the next lookup is one query.
+  forgetHouse();
 }
 
 /**

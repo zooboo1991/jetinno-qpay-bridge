@@ -11,7 +11,11 @@
  *   - a suspended business's machine refuses a sale, and sells again the
  *     moment it pays — no cache in the way;
  *   - the operator's manual payment, fee override and exemption;
- *   - reminders once per stage, by SMS with no link.
+ *   - reminders once per stage, by SMS with no link;
+ *   - the house (020): with OPERATOR_MERCHANT_OWNER_ID set, the subscription
+ *     and unregistered machines' sales go to that business's own QPay; what
+ *     the env account issued before the switch is still checked there; a
+ *     house that cannot be used refuses instead of falling back.
  */
 import { createHmac, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -63,6 +67,7 @@ const mint = (sub) =>
 const QPAY_PORT = 4642;
 const invoices = new Map(); // id -> { body, bearer }
 const paid = new Map(); // id -> amount
+const checks = []; // { id, bearer } — which merchant asked about which invoice
 const qpayFake = createServer((req, res) => {
   let raw = '';
   req.on('data', (d) => (raw += d));
@@ -84,6 +89,7 @@ const qpayFake = createServer((req, res) => {
     }
     if (req.url === '/v2/payment/check') {
       const j = JSON.parse(raw);
+      checks.push({ id: j.object_id, bearer: auth.slice(7) });
       const a = paid.get(j.object_id);
       return res.end(JSON.stringify({ rows: a !== undefined ? [{ payment_id: `p-${j.object_id}`, payment_status: 'PAID', payment_amount: a }] : [] }));
     }
@@ -175,8 +181,8 @@ const ENV = {
   SWEEP_INTERVAL_MS: '1000',
 };
 delete ENV.QPAY_MOCK;
-function boot() {
-  const child = spawn(process.execPath, ['src/server.js'], { env: ENV, stdio: ['ignore', 'pipe', 'pipe'] });
+function boot(extra = {}) {
+  const child = spawn(process.execPath, ['src/server.js'], { env: { ...ENV, ...extra }, stdio: ['ignore', 'pipe', 'pipe'] });
   child.logText = '';
   child.stdout.on('data', (d) => (child.logText += d));
   child.stderr.on('data', (d) => (child.logText += d));
@@ -390,6 +396,152 @@ await check('3 хоногийн өмнө SMS (холбоосгүй, латина
   const susMsg = smsOut.slice(from2).find((m) => m.to === '99110081')?.text ?? '';
   return (first && sentOnce && second && /hugatsaa|duusna/i.test(dueMsg) && /zogsloo/i.test(susMsg) &&
     !/https?:\/\//.test(dueMsg + susMsg)) || { first, sentOnce, second, dueMsg, susMsg };
+});
+
+// ---- the house: the operator's money on a business's own QPay (020) ----------------------------------
+const H = await registerOwner({
+  ownerName: 'Coffeine ХХК', contactPhone: '99110083', deviceNo: `BH${Math.floor(Math.random() * 1e8)}`, location: 'H',
+  username: 'userH', password: 'passH', invoiceCode: 'INV_H',
+});
+const HFP = (await query(`select fingerprint from public.qpay_credentials where id = $1`, [H.credentialId])).rows[0].fingerprint;
+const HOUSE = `house:${H.credentialId}:${HFP}`;
+const UNREG = `UN${Math.floor(Math.random() * 1e8)}`;
+const DB = (await query(`select device_no from public.machines where owner_id = $1`, [b.ownerId])).rows[0].device_no;
+const ownerB = `?ownerId=${b.ownerId}`;
+const tB = await mint(UB);
+const lastInvoice = () => [...invoices.entries()].at(-1);
+const askedBy = (from, id) => checks.slice(from).filter((c) => c.id === id).map((c) => c.bearer);
+const health = async () => (await fetch(`http://localhost:${PORT}/health`)).json();
+const orderRow = async (deviceNo, orderNo) => {
+  let row = null;
+  await until(async () => {
+    row = (await query(`select source, merchant_fp, machine_id, owner_id, qpay_credential_id from public.orders where device_no = $1 and order_no = $2`, [deviceNo, orderNo])).rows[0] ?? null;
+    return row;
+  });
+  return row;
+};
+async function restart(extra) {
+  bridge.kill('SIGTERM');
+  await new Promise((r) => bridge.once('exit', r));
+  bridge = boot(extra);
+  await waitUp();
+}
+
+let envSaleId;
+let envBill;
+let envBillId;
+await check('шилжүүлэхээс өмнө: бүртгэлгүй машин, системийн төлбөр хоёул env данс (operator) дээр', async () => {
+  const s = await sale(UNREG, 'H-ENV-1');
+  const [sid, sq] = lastInvoice();
+  envSaleId = sid;
+  const r = await call(`/owner/v1/billing/invoices${ownerB}`, { token: tB, body: { months: 1 } });
+  envBill = r.json?.invoice;
+  const [bid, bq] = lastInvoice();
+  envBillId = bid;
+  const row = (await query(`select merchant from public.billing_invoices where id = $1`, [envBill?.id])).rows[0];
+  const o = await orderRow(UNREG, 'H-ENV-1');
+  return (s.returnCode === 'SUCCESS' && sq.bearer === 'tok-operator' && bq.bearer === 'tok-operator' && row?.merchant === null &&
+    o?.source === 'env' && o.merchant_fp === null) || { s, sq: sq.bearer, bq: bq.bearer, row, o };
+});
+
+await restart({ OPERATOR_MERCHANT_OWNER_ID: H.ownerId });
+
+await check('OPERATOR_MERCHANT_OWNER_ID тавьсны дараа /health house=ok; хуучин env нэхэмжлэх хуудсанд харагдахгүй', async () => {
+  const up = await until(async () => (await health()).house === 'ok');
+  const j = (await call(`/owner/v1/billing${ownerB}`, { token: tB })).json;
+  return (up && j.state === 'active' && j.openInvoice === null) || { house: (await health()).house, open: j.openInvoice?.id };
+});
+
+let houseBill;
+let houseBillId;
+await check('шинэ нэхэмжлэх «Coffeine»-ийн данс (userH, INV_H) дээр үүсч, аль данснаас гарсан нь тэмдэглэгдэнэ', async () => {
+  const r = await call(`/owner/v1/billing/invoices${ownerB}`, { token: tB, body: { months: 1 } });
+  houseBill = r.json?.invoice;
+  const [id, q] = lastInvoice();
+  houseBillId = id;
+  const row = (await query(`select merchant from public.billing_invoices where id = $1`, [houseBill?.id])).rows[0];
+  const again = await call(`/owner/v1/billing/invoices${ownerB}`, { token: tB, body: { months: 1 } });
+  return (r.status === 200 && houseBill.id !== envBill.id && q.bearer === 'tok-userH' && q.body.invoice_code === 'INV_H' &&
+    row?.merchant === HOUSE && again.json?.invoice?.id === houseBill.id) || { status: r.status, q: q.bearer, row, again: again.json?.invoice?.id };
+});
+
+await check('шилжүүлэхээс өмнөх env нэхэмжлэх төлөгдвөл env данснаас шалгагдаж, хугацаа сунгагдана', async () => {
+  const before = (await query(`select paid_until from public.owners where id = $1`, [b.ownerId])).rows[0].paid_until;
+  paid.set(envBillId, 30000);
+  const from = checks.length;
+  const r = await fetch(`http://localhost:${PORT}/qpay/billing/${envBill.id}/${macFor(envBill.id)}`, { method: 'POST' });
+  const after = (await query(`select paid_until from public.owners where id = $1`, [b.ownerId])).rows[0].paid_until;
+  const by = askedBy(from, envBillId);
+  return (r.status === 200 && after > before && by.length >= 1 && by.every((x) => x === 'tok-operator')) || { status: r.status, by, before, after };
+});
+
+await check('«Coffeine»-ийн данс дээрх нэхэмжлэх «Coffeine»-ийн данснаас шалгагдаж, хугацаа сунгагдана', async () => {
+  const before = (await query(`select paid_until from public.owners where id = $1`, [b.ownerId])).rows[0].paid_until;
+  paid.set(houseBillId, 30000);
+  const from = checks.length;
+  const c = await call(`/owner/v1/billing/invoices/${houseBill.id}/check${ownerB}`, { token: tB, body: {} });
+  const after = (await query(`select paid_until from public.owners where id = $1`, [b.ownerId])).rows[0].paid_until;
+  const by = askedBy(from, houseBillId);
+  return (c.json?.status === 'paid' && after > before && by.length >= 1 && by.every((x) => x === 'tok-userH')) || { c: c.json, by };
+});
+
+let houseSaleId;
+await check('бүртгэлгүй машины борлуулалт «Coffeine»-ийн данс руу; захиалга env мөр хэвээр, house тэмдэгтэй', async () => {
+  const s = await sale(UNREG, 'H-HOUSE-1');
+  const [id, q] = lastInvoice();
+  houseSaleId = id;
+  const o = await orderRow(UNREG, 'H-HOUSE-1');
+  return (s.returnCode === 'SUCCESS' && q.bearer === 'tok-userH' && q.body.invoice_code === 'INV_H' && o?.source === 'env' &&
+    o.merchant_fp === HOUSE && o.machine_id === null && o.owner_id === null && o.qpay_credential_id === null) || { s, q: q.bearer, o };
+});
+
+await check('төлөгдсөн house захиалгыг «Coffeine»-ээс, өмнөх env захиалгыг env-ээс шалгаж, хоёуланд нь кофе гарна', async () => {
+  const from = checks.length;
+  for (const id of [houseSaleId, envSaleId]) {
+    paid.set(id, invoices.get(id).body.amount);
+    await fetch(invoices.get(id).body.callback_url, { method: 'POST' });
+  }
+  const done = await until(() => notifies.includes('H-HOUSE-1') && notifies.includes('H-ENV-1'));
+  const h = askedBy(from, houseSaleId);
+  const e = askedBy(from, envSaleId);
+  return (done && h.length >= 1 && h.every((x) => x === 'tok-userH') && e.length >= 1 && e.every((x) => x === 'tok-operator')) || { done, h, e };
+});
+
+await check('дахин асаасны дараа (санах ой хоосон) ч house захиалгыг «Coffeine»-ийн данснаас шалгана', async () => {
+  const s = await sale(UNREG, 'H-HOUSE-2');
+  const [id] = lastInvoice();
+  await orderRow(UNREG, 'H-HOUSE-2');
+  await restart({ OPERATOR_MERCHANT_OWNER_ID: H.ownerId });
+  paid.set(id, invoices.get(id).body.amount);
+  const from = checks.length;
+  await fetch(invoices.get(id).body.callback_url, { method: 'POST' });
+  const done = await until(() => notifies.includes('H-HOUSE-2'));
+  const by = askedBy(from, id);
+  return (s.returnCode === 'SUCCESS' && done && by.length >= 1 && by.every((x) => x === 'tok-userH')) || { s, done, by };
+});
+
+await check('«Coffeine»-ийн QPay идэвхгүй бол бүртгэлгүй машин зарахгүй, нэхэмжлэх 503 — env данс руу ОРОХГҮЙ; бусад бизнес хэвийн', async () => {
+  await query(`update public.qpay_credentials set is_active = false, status = 'disabled' where id = $1`, [H.credentialId]);
+  await restart({ OPERATOR_MERCHANT_OWNER_ID: H.ownerId });
+  const down = await until(async () => (await health()).house === 'not_connected');
+  const before = invoices.size;
+  const s = await sale(UNREG, 'H-DOWN-1');
+  const inv2 = await call(`/owner/v1/billing/invoices${ownerB}`, { token: tB, body: { months: 3 } });
+  const logged = await until(async () =>
+    (await query(`select count(*)::int n from public.ingest_errors where device_no = $1 and reason = 'SALE_REFUSED_OPERATOR_MERCHANT_NOT_CONNECTED'`, [UNREG])).rows[0].n >= 1);
+  const other = await sale(DB, 'H-DOWN-OTHER');
+  const page = (await call(`/owner/v1/billing${ownerB}`, { token: tB })).json;
+  return (down && s.returnCode === 'FAIL' && inv2.status === 503 && inv2.json?.error === 'UNAVAILABLE' && logged &&
+    other.returnCode === 'SUCCESS' && invoices.size === before + 1 && page?.state && page.openInvoice === null) ||
+    { down, s, inv2: inv2.status, logged, other: other.returnCode, made: invoices.size - before };
+});
+
+await check('OPERATOR_MERCHANT_OWNER_ID буруу утгатай бол env данс руу унахгүй — зарахгүй', async () => {
+  await restart({ OPERATOR_MERCHANT_OWNER_ID: 'coffeine' });
+  const h = await health();
+  const before = invoices.size;
+  const s = await sale(UNREG, 'H-BAD-1');
+  return (h.house === 'misconfigured' && s.returnCode === 'FAIL' && invoices.size === before) || { house: h.house, s };
 });
 
 bridge.kill('SIGTERM');

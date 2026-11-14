@@ -42,6 +42,7 @@ const {
   QPAY_MOCK,
   ALLOW_PRIVATE_NOTIFY,
   ENV_MERCHANT_ONLY,
+  OPERATOR_MERCHANT_OWNER_ID,
 } = process.env;
 
 // ---- 0. switches that must never reach production -----------------------
@@ -75,6 +76,15 @@ JETINNO_USERNAME && JETINNO_APIKEY
 QPAY_USERNAME && QPAY_PASSWORD && QPAY_INVOICE_CODE
   ? ok('QPAY_* (операторын данс)', 'бүртгэлгүй машины fallback — хасаж болохгүй')
   : bad('QPAY_* (операторын данс)', 'гурвуулаа хэрэгтэй');
+
+// ---- 2b. where the operator's money goes (020) ---------------------------
+if (!OPERATOR_MERCHANT_OWNER_ID?.trim()) {
+  warn('OPERATOR_MERCHANT_OWNER_ID', 'тохируулаагүй — системийн төлбөр, бүртгэлгүй машин QPAY_* данс руу');
+} else if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(OPERATOR_MERCHANT_OWNER_ID.trim())) {
+  bad('OPERATOR_MERCHANT_OWNER_ID', 'бизнесийн id (uuid) биш — системийн төлбөр, бүртгэлгүй машин зогсоно');
+} else {
+  ok('OPERATOR_MERCHANT_OWNER_ID', 'тэр бизнесийн холбосон QPay — /health дээр house=ok эсэхийг шалга');
+}
 
 // ---- 3. the crypto keyring ----------------------------------------------
 function checkKey(name, value, { prefixed = false } = {}) {
