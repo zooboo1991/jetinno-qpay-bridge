@@ -76,6 +76,17 @@ export function forgetCredential(credentialId) {
   }
 }
 
+/**
+ * Drops every entry of one business. A subscription payment (or a lapse)
+ * changes whether all of its machines may sell, and the business is waiting
+ * at the machine to find out.
+ */
+export function forgetOwner(ownerId) {
+  for (const [deviceNo, entry] of byDevice) {
+    if (entry.row?.owner_id === ownerId) byDevice.delete(deviceNo);
+  }
+}
+
 /** Drops one device's entry — for the registration CLI and for tests. */
 export function forgetDevice(deviceNo) {
   byDevice.delete(deviceNo);

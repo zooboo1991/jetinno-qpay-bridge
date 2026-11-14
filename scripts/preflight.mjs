@@ -143,6 +143,8 @@ if (!DATABASE_URL) {
       ['017 app.operator_create_notification', 'operator_create_notification'],
       ['018 app.reserve_verify_attempt', 'reserve_verify_attempt'],
       ['018 app.auth_attempt', 'auth_attempt'],
+      ['019 app.owner_billing', 'owner_billing'],
+      ['019 app.billing_mark_paid', 'billing_mark_paid'],
     ]) {
       const { rows } = await pool.query(
         `select exists(select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace

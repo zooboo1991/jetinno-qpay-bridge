@@ -12,6 +12,7 @@ import * as owners from './owners.js';
 import * as alerts from './alerts.js';
 import { authHook, authHookConfigured } from './auth-hook.js';
 import { guardApi, guardConfigured } from './guard.js';
+import * as billing from './billing.js';
 import { pushConfigured, pushSale } from './push.js';
 import { open, credentialAad } from './crypto.js';
 import { createHmac, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
@@ -359,7 +360,11 @@ async function merchantFor(deviceNo, orderNo) {
           ? `CREDENTIAL_${machine.credential_status}`
           : !machine.credential_active
             ? 'CREDENTIAL_INACTIVE'
-            : null;
+            : billing.saleSuspended(machine)
+              // The subscription lapsed past its grace (019). Paying from the
+              // portal restores every machine of the business at once.
+              ? 'BILLING_SUSPENDED'
+              : null;
   if (blocked) {
     const reason = `SALE_REFUSED_${blocked}`.toUpperCase();
     log('sale refused', deviceNo, reason);
@@ -1132,6 +1137,30 @@ app.all('/qpay/callback/:orderNo', callbackLimit, (req, res) => {
   );
 });
 
+/*
+ * QPay's callback for a subscription payment (019). Signed like the sale
+ * callback; unsigned, it costs nothing. Credited once however often QPay
+ * calls; 503 while QPay does not yet show it paid, so QPay comes back.
+ */
+app.all('/qpay/billing/:invoiceId/:mac', (req, res) => {
+  const { invoiceId, mac } = req.params;
+  if (!/^[0-9a-f-]{36}$/i.test(invoiceId) || !billing.billingMacValid(invoiceId, mac)) {
+    return callbackLimit(req, res, () => res.status(200).send('SUCCESS'));
+  }
+  track(
+    billing
+      .checkInvoice(invoiceId, { log })
+      .then((r) => {
+        log('billing callback', invoiceId, r.status);
+        res.status(r.status === 'open' ? 503 : 200).send(r.status === 'open' ? 'RETRY' : 'SUCCESS');
+      })
+      .catch((err) => {
+        log('billing callback failed', invoiceId, firstLine(err));
+        res.status(503).send('RETRY');
+      })
+  );
+});
+
 // The same settle by hand — the operator's manual recovery path. Always
 // behind the debug key: open, it confirmed live orderNos to anyone and let
 // strangers spend our QPay API quota. The ?key= cookie exchange keeps it
@@ -1615,6 +1644,8 @@ async function sweepTick() {
   if (Date.now() - lastPrune > 3600_000) {
     lastPrune = Date.now();
     store.pruneAuthAttempts().catch(() => {});
+    // Subscription reminders (019): three days before, and at suspension.
+    await billing.sendBillingNotices(log).catch((e) => log('billing notices error', firstLine(e)));
   }
 }
 

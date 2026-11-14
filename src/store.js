@@ -28,6 +28,8 @@ export async function resolveMachine(deviceNo) {
             m.status        as machine_status,
             m.updated_at    as machine_updated_at,
             o.status        as owner_status,
+            o.paid_until    as owner_paid_until,
+            o.billing_exempt as owner_billing_exempt,
             c.sealed,
             c.key_id,
             c.fingerprint     as credential_fingerprint,
@@ -1196,3 +1198,95 @@ export async function credentialPerKey() {
   );
   return rows;
 }
+
+// ---------------------------------------------------------------------------
+// The system subscription (migration 019). Fees and grace come from the
+// bridge's env and are passed in, so one value decides charge and display.
+// ---------------------------------------------------------------------------
+export async function ownerBilling(ownerId, { fee, graceDays, noticeDays }) {
+  const { rows } = await query(`select * from app.owner_billing($1, $2, $3, $4)`, [ownerId, fee, graceDays, noticeDays]);
+  return rows[0] ?? null;
+}
+
+export async function billingHistory(ownerId, limit = 24) {
+  const { rows } = await query(
+    `select id, source, months, amount_mnt, status, created_at, paid_at, period_from, period_to, note
+       from public.billing_invoices where owner_id = $1
+      order by created_at desc limit $2`,
+    [ownerId, limit]
+  );
+  return rows;
+}
+
+/** The newest open QPay invoice under a day old, optionally for a number of months. */
+export async function openBillingInvoice(ownerId, months = null) {
+  return one(
+    `select * from public.billing_invoices
+      where owner_id = $1 and source = 'qpay' and status = 'open' and qpay_invoice_id is not null
+        and created_at > now() - interval '24 hours'
+        and ($2::int is null or months = $2)
+      order by created_at desc limit 1`,
+    [ownerId, months]
+  );
+}
+
+export async function billingInvoicesLastHour(ownerId) {
+  const { rows } = await query(
+    `select count(*)::int n from public.billing_invoices
+      where owner_id = $1 and source = 'qpay' and created_at > now() - interval '1 hour'`,
+    [ownerId]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+export const insertBillingInvoice = ({ ownerId, months, machines, feePerMachine, amount, createdBy }) =>
+  one(
+    `insert into public.billing_invoices (owner_id, months, machines, fee_per_machine_mnt, amount_mnt, source, created_by)
+     values ($1, $2, $3, $4, $5, 'qpay', $6) returning id`,
+    [ownerId, months, machines, feePerMachine, amount, createdBy ?? null]
+  );
+
+export const attachBillingQpay = (id, { invoiceId, senderInvoiceNo, qrText, qrImage, shortUrl, urls }) =>
+  query(
+    `update public.billing_invoices
+        set qpay_invoice_id = $2, qpay_sender_invoice_no = $3, qr_text = $4, qr_image = $5, short_url = $6, bank_urls = $7::jsonb
+      where id = $1`,
+    [id, invoiceId, senderInvoiceNo, qrText ?? null, qrImage ?? null, shortUrl ?? null, JSON.stringify(urls ?? [])]
+  );
+
+export const cancelBillingInvoice = (id) =>
+  query(`update public.billing_invoices set status = 'cancelled' where id = $1 and status = 'open'`, [id]);
+
+export const billingInvoice = (id) => one(`select * from public.billing_invoices where id = $1`, [id]);
+
+export async function billingMarkPaid(id, paymentId, paidAmount) {
+  const { rows } = await query(`select * from app.billing_mark_paid($1, $2, $3)`, [id, paymentId ?? null, paidAmount]);
+  return rows[0] ?? { out_status: 'error' };
+}
+
+export async function operatorBillingOverview(actorUserId, { fee, graceDays, noticeDays }) {
+  const { rows } = await query(`select * from app.operator_billing_overview($1, $2, $3, $4)`, [actorUserId, fee, graceDays, noticeDays]);
+  return rows;
+}
+
+export async function operatorBillingExtend(actorUserId, { ownerId, months, amount, feePerMachine, machines, note }) {
+  const { rows } = await query(`select * from app.operator_billing_extend($1, $2, $3, $4, $5, $6, $7)`, [
+    actorUserId, ownerId, months, amount, feePerMachine, machines, note ?? null,
+  ]);
+  return rows[0] ?? { out_status: 'error', out_paid_until: null };
+}
+
+export async function operatorBillingSettings(actorUserId, ownerId, { setFee, fee, setExempt, exempt }) {
+  const { rows } = await query(`select app.operator_billing_settings($1, $2, $3, $4, $5, $6) as status`, [
+    actorUserId, ownerId, setFee, fee, setExempt, exempt,
+  ]);
+  return rows[0]?.status ?? 'error';
+}
+
+export async function billingNoticesDue({ fee, graceDays, noticeDays }) {
+  const { rows } = await query(`select * from app.billing_notices_due($1, $2, $3)`, [fee, graceDays, noticeDays]);
+  return rows;
+}
+
+export const billingNoticeSent = (ownerId, stage, paidUntil) =>
+  query(`select app.billing_notice_sent($1, $2, $3)`, [ownerId, stage, paidUntil]);

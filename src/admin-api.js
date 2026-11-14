@@ -1,7 +1,8 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import * as store from './store.js';
-import { forgetDevice, forgetCredential } from './owners.js';
+import { forgetDevice, forgetCredential, forgetOwner } from './owners.js';
+import * as billing from './billing.js';
 import { pushToOwners } from './push.js';
 import { verifyAccessToken, isTokenError } from './owner-auth.js';
 import { apiGate } from './db.js';
@@ -400,6 +401,65 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     }
     log('admin credential active', r.out_status, ownerId, String(req.body.active));
     return { status: r.out_status, affectedMachines: r.out_affected_machines ?? 0 };
+  }));
+
+  // -------------------------------------------------------------------------
+  // The system subscription (migration 019).
+  // -------------------------------------------------------------------------
+  router.get('/billing', handler('billing', async (req) => ({
+    owners: (await store.operatorBillingOverview(req.operator.userId, billing.BILLING)).map((r) => ({
+      ownerId: r.out_owner_id,
+      state: r.out_state,
+      paidUntil: r.out_paid_until,
+      machines: r.out_machines,
+      monthlyFeeMnt: r.out_monthly_fee,
+      feePerMachineMnt: r.out_fee_per_machine,
+      exempt: r.out_exempt,
+      feeOverride: r.out_fee_override,
+    })),
+  })));
+
+  router.get('/owners/:ownerId/billing', handler('owner billing', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId) return null;
+    return billing.billingFor(ownerId, { autoCheck: false, log });
+  }));
+
+  /** Cash or a bank transfer, entered by the operator: the months are credited at once. */
+  router.post('/owners/:ownerId/billing/extend', json, handler('billing extend', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    const months = Number(req.body?.months);
+    if (!ownerId) return { status: 'not_found', paidUntil: null };
+    if (!Number.isInteger(months) || months < 1 || months > 12) return { status: 'invalid', paidUntil: null };
+    const b = await store.ownerBilling(ownerId, billing.BILLING);
+    if (!b) return { status: 'not_found', paidUntil: null };
+    const rawAmount = req.body?.amountMnt;
+    const amount = rawAmount === undefined || rawAmount === null || rawAmount === '' ? b.out_monthly_fee * months : Number(rawAmount);
+    if (!Number.isInteger(amount) || amount < 0) return { status: 'invalid', paidUntil: null };
+    const r = await store.operatorBillingExtend(req.operator.userId, {
+      ownerId, months, amount, feePerMachine: b.out_fee_per_machine, machines: b.out_machines,
+      note: str(req.body?.note).trim().slice(0, 300),
+    });
+    if (r.out_status === 'ok') forgetOwner(ownerId);
+    log('admin billing extend', r.out_status, ownerId, String(months));
+    return { status: r.out_status, paidUntil: r.out_paid_until ?? null };
+  }));
+
+  /** The per-machine fee (null: the default) and the exemption; an absent field is left alone. */
+  router.post('/owners/:ownerId/billing/settings', json, handler('billing settings', async (req) => {
+    const ownerId = uuidOrNull(req.params.ownerId);
+    if (!ownerId) return { status: 'not_found' };
+    const b = req.body ?? {};
+    const setFee = Object.prototype.hasOwnProperty.call(b, 'feePerMachineMnt');
+    const fee = b.feePerMachineMnt === null || b.feePerMachineMnt === '' ? null : Number(b.feePerMachineMnt);
+    if (setFee && fee !== null && (!Number.isInteger(fee) || fee < 0)) return { status: 'invalid' };
+    const setExempt = typeof b.exempt === 'boolean';
+    const status = await store.operatorBillingSettings(req.operator.userId, ownerId, {
+      setFee, fee: setFee ? fee : null, setExempt, exempt: setExempt ? b.exempt : null,
+    });
+    if (status === 'ok') forgetOwner(ownerId);
+    log('admin billing settings', status, ownerId);
+    return { status };
   }));
 
   router.post('/owners/:ownerId/invoice-code', json, handler('invoice-code', async (req) => {

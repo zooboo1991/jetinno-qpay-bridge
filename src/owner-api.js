@@ -1,6 +1,7 @@
 import express from 'express';
 import * as store from './store.js';
 import { apiGate } from './db.js';
+import * as billing from './billing.js';
 import { requireOwner, resolveOwnerId, authConfigured } from './owner-auth.js';
 import { endpointAllowed, publicKey, pushConfigured, pushToUser } from './push.js';
 
@@ -269,6 +270,36 @@ export function ownerApi({ log = () => {}, portalOrigin = '' } = {}) {
     if (!ownerId) return undefined;
     await store.markNotificationsSeen(ownerId, req.owner.userId);
     return { ok: true };
+  }));
+
+  // -------------------------------------------------------------------------
+  // The system subscription (migration 019). The portal's billing page must
+  // work for a suspended business — it is the one page that page leads to.
+  // -------------------------------------------------------------------------
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  router.get('/billing', ...read('billing', async (ownerId) => billing.billingFor(ownerId, { log })));
+
+  router.post('/billing/invoices', ...act('billing invoice', async (req, res) => {
+    const ownerId = resolveOwnerId(req, res);
+    if (!ownerId) return undefined;
+    try {
+      return { invoice: await billing.createInvoice(ownerId, Number(req.body?.months), req.owner.userId, log) };
+    } catch (err) {
+      if (err instanceof billing.BillingError) return void res.status(err.status).json({ error: err.code });
+      throw err;
+    }
+  }));
+
+  router.post('/billing/invoices/:invoiceId/check', ...act('billing check', async (req, res) => {
+    const ownerId = resolveOwnerId(req, res);
+    if (!ownerId) return undefined;
+    const id = String(req.params.invoiceId ?? '');
+    const inv = UUID.test(id) ? await store.billingInvoice(id) : null;
+    // Somebody else's invoice is as absent as a missing one.
+    if (!inv || inv.owner_id !== ownerId) return void res.status(404).json({ error: 'NOT_FOUND' });
+    const r = await billing.checkInvoice(inv.id, { log });
+    return { status: r.status === 'not_found' ? 'cancelled' : r.status, paidUntil: r.paidUntil ?? null };
   }));
 
   /** Who am I, and which businesses can I switch between. */

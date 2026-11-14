@@ -24,7 +24,8 @@
     "test:resilience": "node scripts/resilience-test.mjs",
     "test:settle": "bash scripts/settle-test.sh",
     "test:qpay": "node scripts/qpay-cache-test.mjs",
-    "test:grants": "bash scripts/grants-test.sh"
+    "test:grants": "bash scripts/grants-test.sh",
+    "test:billing": "bash scripts/billing-test.sh"
   },
   "engines": {
     "node": ">=20"

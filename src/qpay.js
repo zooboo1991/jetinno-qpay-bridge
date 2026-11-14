@@ -231,6 +231,9 @@ function makeClient({ username, password, invoiceCode, cacheKey }) {
         qrText: json.qr_text,
         qrImage: json.qr_image,
         shortUrl: json.qPay_shortUrl,
+        // The banks' app links for this invoice — what a phone taps instead
+        // of scanning a QR shown on its own screen.
+        urls: Array.isArray(json.urls) ? json.urls : [],
       };
     },
 

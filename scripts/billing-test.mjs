@@ -1,0 +1,404 @@
+/**
+ * The system subscription (migration 019). Run: npm run test:billing
+ *
+ * A business pays 30,000₮ a month per active machine, through QPay on the
+ * operator's merchant; each payment extends paid_until; three days after it
+ * lapses the business's machines refuse sales until it pays. What this file
+ * holds the bridge to:
+ *   - the state names and the fee the portal shows;
+ *   - an invoice for N months at machines × fee × N, reused while open;
+ *   - the signed callback credits once, from the later of paid_until and now;
+ *   - a suspended business's machine refuses a sale, and sells again the
+ *     moment it pays — no cache in the way;
+ *   - the operator's manual payment, fee override and exemption;
+ *   - reminders once per stage, by SMS with no link.
+ */
+import { createHmac, randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { generateKeyPair, exportJWK, SignJWT } from 'jose';
+
+process.env.CRED_KEYS = process.env.CRED_KEYS ?? `k1:${Buffer.from(Array.from({ length: 32 }, (_, i) => i * 7 % 256)).toString('base64')}`;
+process.env.CRED_KEY_ACTIVE = process.env.CRED_KEY_ACTIVE ?? 'k1';
+process.env.CRED_FP_KEY = process.env.CRED_FP_KEY ?? Buffer.from(Array.from({ length: 32 }, (_, i) => i * 11 % 256)).toString('base64');
+
+const { query, close } = await import('../src/db.js');
+const { registerOwner } = await import('../src/register-owner.js');
+const { SIGNABLE, buildSign, timestamp } = await import('../src/sign.js');
+
+const results = [];
+const check = async (name, fn) => {
+  try {
+    const ok = await fn();
+    results.push([ok === true, name, ok === true ? '' : ` — ${typeof ok === 'string' ? ok : JSON.stringify(ok)}`]);
+  } catch (err) {
+    results.push([false, name, ` — ${err.message.split('\n')[0]}`]);
+  }
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (fn, ms = 6000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (await fn()) return true;
+    await sleep(150);
+  }
+  return false;
+};
+
+// ---- Supabase stand-in ---------------------------------------------------------
+const { publicKey, privateKey } = await generateKeyPair('ES256', { extractable: true });
+const jwk = { ...(await exportJWK(publicKey)), kid: 'k1', alg: 'ES256', use: 'sig' };
+const JWKS_PORT = 4641;
+const ISS = `http://127.0.0.1:${JWKS_PORT}`;
+const jwks = createServer((q, r) => {
+  r.setHeader('content-type', 'application/json');
+  r.end(JSON.stringify({ keys: [jwk] }));
+});
+await new Promise((r) => jwks.listen(JWKS_PORT, '127.0.0.1', r));
+const mint = (sub) =>
+  new SignJWT({}).setProtectedHeader({ alg: 'ES256', kid: 'k1' }).setSubject(sub).setIssuedAt()
+    .setIssuer(`${ISS}/auth/v1`).setAudience('authenticated').setExpirationTime('1h').sign(privateKey);
+
+// ---- QPay stand-in -----------------------------------------------------------
+const QPAY_PORT = 4642;
+const invoices = new Map(); // id -> { body, bearer }
+const paid = new Map(); // id -> amount
+const qpayFake = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (d) => (raw += d));
+  req.on('end', () => {
+    const auth = req.headers.authorization ?? '';
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/v2/auth/token') {
+      const [user] = Buffer.from(auth.replace('Basic ', ''), 'base64').toString().split(':');
+      return res.end(JSON.stringify({ access_token: `tok-${user}`, expires_in: 3600 }));
+    }
+    if (req.url === '/v2/invoice' && req.method === 'POST') {
+      const body = JSON.parse(raw);
+      const id = `binv-${invoices.size + 1}`;
+      invoices.set(id, { body, bearer: auth.slice(7) });
+      return res.end(JSON.stringify({
+        invoice_id: id, qr_text: 'QRTEXT', qr_image: 'iVBORw0KGgo=', qPay_shortUrl: `https://s.qpay.mn/${id}`,
+        urls: [{ name: 'Khan bank', description: 'Хаан банк', logo: 'https://qpay.mn/q/logo/khanbank.png', link: `khanbank://q?qPay_QRcode=${id}` }],
+      }));
+    }
+    if (req.url === '/v2/payment/check') {
+      const j = JSON.parse(raw);
+      const a = paid.get(j.object_id);
+      return res.end(JSON.stringify({ rows: a !== undefined ? [{ payment_id: `p-${j.object_id}`, payment_status: 'PAID', payment_amount: a }] : [] }));
+    }
+    if (req.method === 'DELETE') return res.end('{}');
+    res.statusCode = 404;
+    res.end('{}');
+  });
+});
+await new Promise((r) => qpayFake.listen(QPAY_PORT, '127.0.0.1', r));
+
+// ---- SMS gateway stand-in ------------------------------------------------------------
+const SMS_PORT = 4643;
+const smsOut = [];
+const smsFake = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (d) => (raw += d));
+  req.on('end', () => {
+    const p = new URLSearchParams(raw);
+    smsOut.push({ to: p.get('sendto'), text: p.get('message') });
+    res.setHeader('content-type', 'application/json');
+    res.end('{"status":1}');
+  });
+});
+await new Promise((r) => smsFake.listen(SMS_PORT, '127.0.0.1', r));
+
+// ---- a machine that answers PAYSUCCESS -----------------------------------------------
+const MACHINE_PORT = 4644;
+const notifies = [];
+const machine = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (d) => (raw += d));
+  req.on('end', () => {
+    notifies.push(JSON.parse(raw || '{}')?.data?.orderNo);
+    res.end(JSON.stringify({ returnCode: 'SUCCESS', msg: 'SUCCESS' }));
+  });
+});
+await new Promise((r) => machine.listen(MACHINE_PORT, '127.0.0.1', r));
+
+// ---- businesses ------------------------------------------------------------------------
+const DA = `BA${Math.floor(Math.random() * 1e8)}`;
+const DA2 = `BB${Math.floor(Math.random() * 1e8)}`;
+const a = await registerOwner({
+  ownerName: 'Төлбөр ХХК', contactPhone: '99110081', deviceNo: DA, location: 'A',
+  username: 'userA', password: 'passA', invoiceCode: 'INV_A',
+});
+// A second machine on the same business: the fee is per machine.
+await query(
+  `insert into public.machines (owner_id, device_no, label, location, notify_url, qpay_credential_id, status)
+   select owner_id, $2, label, 'A2', notify_url, qpay_credential_id, 'active' from public.machines where device_no = $1`,
+  [DA, DA2]
+).catch(async () => {
+  // Older column sets: copy whatever the first machine has.
+  await query(
+    `insert into public.machines (owner_id, device_no, qpay_credential_id, status)
+     select owner_id, $2, qpay_credential_id, 'active' from public.machines where device_no = $1`,
+    [DA, DA2]
+  );
+});
+const b = await registerOwner({
+  ownerName: 'Бусад ХХК', contactPhone: '99110082', deviceNo: `BC${Math.floor(Math.random() * 1e8)}`, location: 'B',
+  username: 'userB', password: 'passB', invoiceCode: 'INV_B',
+});
+const UA = randomUUID();
+const UB = randomUUID();
+const OPERATOR = randomUUID();
+await query(`insert into auth.users (id, phone) values ($1,'97699110081'), ($2,'97699110082'), ($3,'97699110089')`, [UA, UB, OPERATOR]);
+await query(`insert into public.owner_members (owner_id, user_id, role) values ($1,$2,'admin'), ($3,$4,'admin')`, [a.ownerId, UA, b.ownerId, UB]);
+await query(`insert into public.operators (user_id, label) values ($1, 'Тест оператор')`, [OPERATOR]);
+
+// ---- the bridge ----------------------------------------------------------------------------
+const PORT = 3196;
+const ENV = {
+  ...process.env,
+  PORT: String(PORT),
+  JETINNO_USERNAME: 'testname',
+  JETINNO_APIKEY: 'DBRW17YE7FHKR72T',
+  PUBLIC_URL: `http://localhost:${PORT}`,
+  QPAY_BASE_URL: `http://127.0.0.1:${QPAY_PORT}`,
+  QPAY_USERNAME: 'operator',
+  QPAY_PASSWORD: 'op-pass',
+  QPAY_INVOICE_CODE: 'INV_OPERATOR',
+  SUPABASE_URL: ISS,
+  PORTAL_ORIGIN: 'https://kofe.mn',
+  SMS_API_URL: `http://127.0.0.1:${SMS_PORT}/send`,
+  SMS_API_KEY: 'k',
+  SEND_SMS_HOOK_SECRET: `v1,whsec_${Buffer.from('x'.repeat(32)).toString('base64')}`,
+  ALLOW_PRIVATE_NOTIFY: '1',
+  CRED_ALLOW_HTTP: '1',
+  SWEEP_INTERVAL_MS: '1000',
+};
+delete ENV.QPAY_MOCK;
+function boot() {
+  const child = spawn(process.execPath, ['src/server.js'], { env: ENV, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.logText = '';
+  child.stdout.on('data', (d) => (child.logText += d));
+  child.stderr.on('data', (d) => (child.logText += d));
+  return child;
+}
+async function waitUp() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      if ((await fetch(`http://localhost:${PORT}/health`)).ok) return;
+    } catch {
+      // not yet
+    }
+    await sleep(250);
+  }
+  throw new Error('bridge did not start');
+}
+let bridge = boot();
+await waitUp();
+
+const call = async (path, { token, body, method = body ? 'POST' : 'GET' } = {}) => {
+  const res = await fetch(`http://localhost:${PORT}${path}`, {
+    method,
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { status: res.status, json };
+};
+const setPaidUntil = (ownerId, sql) => query(`update public.owners set paid_until = ${sql} where id = $1`, [ownerId]);
+const ownerA = `?ownerId=${a.ownerId}`;
+const tA = await mint(UA);
+const op = await mint(OPERATOR);
+
+function signedSale(deviceNo, orderNo) {
+  const data = { deviceNo, productId: '1', productName: 'Латте', orderNo, orderAmount: '450000', notifyUrl: `http://127.0.0.1:${MACHINE_PORT}/notify` };
+  const body = { username: 'testname', time: timestamp(), data };
+  body.sign = buildSign({ username: body.username, time: body.time, ...data }, SIGNABLE.getQrCodeRequest, 'DBRW17YE7FHKR72T');
+  return body;
+}
+const sale = (deviceNo, orderNo) =>
+  fetch(`http://localhost:${PORT}/jetinno/getQrCode`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(signedSale(deviceNo, orderNo)) })
+    .then((r) => r.json());
+const MAC_KEY = createHmac('sha256', 'DBRW17YE7FHKR72T').update('qpay-billing-v1').digest();
+const macFor = (id) => createHmac('sha256', MAC_KEY).update(id).digest('base64url').slice(0, 22);
+
+// ---- states ------------------------------------------------------------------------------------
+await check('шинэ бизнес эхний сар үнэгүй: идэвхтэй, 2 машин × 30,000₮ = 60,000₮/сар', async () => {
+  const r = await call(`/owner/v1/billing${ownerA}`, { token: tA });
+  const j = r.json;
+  const days = Math.round((new Date(j.paidUntil) - Date.now()) / 86400000);
+  return (r.status === 200 && j.state === 'active' && j.machines === 2 && j.feePerMachineMnt === 30000 &&
+    j.monthlyFeeMnt === 60000 && days >= 27 && days <= 32 &&
+    j.options.map((o) => `${o.months}:${o.amountMnt}`).join() === '1:60000,3:180000,6:360000,12:720000') || j;
+});
+
+await check('төлөвүүд: due_soon (3 хоногийн өмнө), overdue (хугацаа өнгөрсөн), suspended (3 хоногийн дараа)', async () => {
+  const out = [];
+  for (const [sql, want] of [["now() + interval '2 days'", 'due_soon'], ["now() - interval '1 day'", 'overdue'], ["now() - interval '4 days'", 'suspended']]) {
+    await setPaidUntil(a.ownerId, sql);
+    out.push((await call(`/owner/v1/billing${ownerA}`, { token: tA })).json?.state === want ? want : `!${want}`);
+  }
+  return out.every((x) => !x.startsWith('!')) || out;
+});
+
+// ---- suspension at the machine -------------------------------------------------------------------
+await check('төлбөр хугацаа хэтэрсэн (suspended) бизнесийн машин зарахгүй, шалтгаан бүртгэгдэнэ', async () => {
+  const r = await sale(DA, 'B-SUSP-1');
+  const logged = await until(async () =>
+    (await query(`select count(*)::int n from public.ingest_errors where device_no = $1 and reason = 'SALE_REFUSED_BILLING_SUSPENDED'`, [DA])).rows[0].n >= 1);
+  return (r.returnCode === 'FAIL' && logged) || r;
+});
+
+await check('өөр бизнесийн машин хэвийн зарна', async () => {
+  const r = await sale((await query(`select device_no from public.machines where owner_id = $1`, [b.ownerId])).rows[0].device_no, 'B-OTHER-1');
+  return r.returnCode === 'SUCCESS' || r;
+});
+
+// ---- paying ------------------------------------------------------------------------------------------
+let inv;
+await check('3 сарын нэхэмжлэх: 180,000₮, операторын дансаар, QR + банкны холбоостой, гарын үсэгтэй callback', async () => {
+  const r = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 3 } });
+  inv = r.json?.invoice;
+  const q = [...invoices.values()].at(-1);
+  return (r.status === 200 && inv.amountMnt === 180000 && inv.months === 3 && inv.qrImage && inv.bankUrls[0]?.link.startsWith('khanbank://') &&
+    q.bearer === 'tok-operator' && q.body.amount === 180000 && q.body.callback_url.endsWith(`/qpay/billing/${inv.id}/${macFor(inv.id)}`)) || { r: r.json, q };
+});
+
+await check('ижил хугацааны нээлттэй нэхэмжлэхийг дахин өгнө — шинээр үүсгэхгүй', async () => {
+  const before = invoices.size;
+  const r = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 3 } });
+  const bad = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 2 } });
+  return (r.json?.invoice?.id === inv.id && invoices.size === before && bad.status === 400 && bad.json?.error === 'INVALID_MONTHS') || { r: r.json, bad };
+});
+
+await check('төлөөгүй байхад «шалгах» open буцаана; өөр бизнесийнх 404', async () => {
+  const r = await call(`/owner/v1/billing/invoices/${inv.id}/check${ownerA}`, { token: tA, body: {} });
+  const other = await call(`/owner/v1/billing/invoices/${inv.id}/check?ownerId=${b.ownerId}`, { token: await mint(UB), body: {} });
+  return (r.json?.status === 'open' && other.status === 404) || { r: r.json, other: other.status };
+});
+
+await check('гарын үсэггүй callback юу ч хийхгүй', async () => {
+  paid.set([...invoices.keys()].at(-1), 180000);
+  const r = await fetch(`http://localhost:${PORT}/qpay/billing/${inv.id}/AAAAAAAAAAAAAAAAAAAAAA`, { method: 'POST' });
+  const row = (await query(`select status from public.billing_invoices where id = $1`, [inv.id])).rows[0];
+  return (r.status === 200 && row.status === 'open') || row;
+});
+
+await check('гарын үсэгтэй callback: 3 сар нэмэгдэж (одооноос, учир нь хугацаа өнгөрсөн), машин ШУУД зарна', async () => {
+  const r = await fetch(`http://localhost:${PORT}/qpay/billing/${inv.id}/${macFor(inv.id)}`, { method: 'POST' });
+  const o = (await query(`select paid_until from public.owners where id = $1`, [a.ownerId])).rows[0];
+  const days = Math.round((new Date(o.paid_until) - Date.now()) / 86400000);
+  const s = await sale(DA, 'B-AFTER-PAY');
+  return (r.status === 200 && days >= 88 && days <= 93 && s.returnCode === 'SUCCESS') || { status: r.status, days, s };
+});
+
+await check('QPay дахин дуудсан ч дахин сунгахгүй (нэг л удаа)', async () => {
+  const before = (await query(`select paid_until from public.owners where id = $1`, [a.ownerId])).rows[0].paid_until;
+  await fetch(`http://localhost:${PORT}/qpay/billing/${inv.id}/${macFor(inv.id)}`, { method: 'POST' });
+  const after = (await query(`select paid_until from public.owners where id = $1`, [a.ownerId])).rows[0].paid_until;
+  return before.getTime() === after.getTime() || `${before} -> ${after}`;
+});
+
+await check('хугацаа дуусаагүй үед төлбөл одоогийн хугацааны ард залгагдана', async () => {
+  const before = (await query(`select paid_until from public.owners where id = $1`, [a.ownerId])).rows[0].paid_until;
+  const r = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 1 } });
+  paid.set([...invoices.keys()].at(-1), 60000);
+  const c = await call(`/owner/v1/billing/invoices/${r.json.invoice.id}/check${ownerA}`, { token: tA, body: {} });
+  const after = (await query(`select paid_until from public.owners where id = $1`, [a.ownerId])).rows[0].paid_until;
+  const days = (after - before) / 86400000;
+  return (c.json?.status === 'paid' && days >= 28 && days <= 31) || { c: c.json, days };
+});
+
+await check('дутуу төлбөрөөр хугацаа сунгахгүй', async () => {
+  const r = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 6 } });
+  paid.set([...invoices.keys()].at(-1), 1000);
+  const c = await call(`/owner/v1/billing/invoices/${r.json.invoice.id}/check${ownerA}`, { token: tA, body: {} });
+  const row = (await query(`select status from public.billing_invoices where id = $1`, [r.json.invoice.id])).rows[0];
+  return (c.json?.status === 'open' && row.status === 'open') || { c: c.json, row };
+});
+
+await check('түүх: QPay-ийн төлбөрүүд хугацааны хамт харагдана', async () => {
+  const j = (await call(`/owner/v1/billing${ownerA}`, { token: tA })).json;
+  const paidRows = j.history.filter((h) => h.status === 'paid');
+  return (paidRows.length === 2 && paidRows.every((h) => h.source === 'qpay' && h.periodTo)) || j.history;
+});
+
+// ---- the operator ----------------------------------------------------------------------------------
+await check('оператор бүх бизнесийн төлбөрийн төлөвийг харна; эзэмшигч харж чадахгүй', async () => {
+  const r = await call('/admin/v1/billing', { token: op });
+  const mine = r.json?.owners?.find((o) => o.ownerId === a.ownerId);
+  const owner = await call('/admin/v1/billing', { token: tA });
+  return (mine?.state === 'active' && mine.monthlyFeeMnt === 60000 && owner.status === 401) || { r: r.json, owner: owner.status };
+});
+
+await check('оператор гараар (бэлэн/шилжүүлэг) 1 сар бүртгэхэд хугацаа сунгагдаж, түүхэнд тэмдэглэлтэй орно', async () => {
+  const before = (await query(`select paid_until from public.owners where id = $1`, [b.ownerId])).rows[0].paid_until;
+  const r = await call(`/admin/v1/owners/${b.ownerId}/billing/extend`, { token: op, body: { months: 1, note: 'Бэлнээр' } });
+  const after = (await query(`select paid_until from public.owners where id = $1`, [b.ownerId])).rows[0].paid_until;
+  const h = (await call(`/admin/v1/owners/${b.ownerId}/billing`, { token: op })).json?.history?.[0];
+  const days = (after - before) / 86400000;
+  return (r.json?.status === 'ok' && days >= 28 && days <= 31 && h?.source === 'manual' && h.note === 'Бэлнээр' && h.amountMnt === 30000) || { r: r.json, h, days };
+});
+
+await check('оператор нэг бизнесийн машины үнийг өөрчилнө; хоосон бол үндсэн үнэ', async () => {
+  const s1 = await call(`/admin/v1/owners/${a.ownerId}/billing/settings`, { token: op, body: { feePerMachineMnt: 20000 } });
+  const v1 = (await call(`/owner/v1/billing${ownerA}`, { token: tA })).json;
+  const s2 = await call(`/admin/v1/owners/${a.ownerId}/billing/settings`, { token: op, body: { feePerMachineMnt: null } });
+  const v2 = (await call(`/owner/v1/billing${ownerA}`, { token: tA })).json;
+  return (s1.json?.status === 'ok' && v1.monthlyFeeMnt === 40000 && s2.json?.status === 'ok' && v2.monthlyFeeMnt === 60000) || { v1: v1.monthlyFeeMnt, v2: v2.monthlyFeeMnt };
+});
+
+await check('чөлөөлсөн бизнес хугацаа хэтэрсэн ч зарна, нэхэмжлэх үүсгэхгүй', async () => {
+  await call(`/admin/v1/owners/${a.ownerId}/billing/settings`, { token: op, body: { exempt: true } });
+  await setPaidUntil(a.ownerId, "now() - interval '10 days'");
+  const s = await sale(DA, 'B-EXEMPT');
+  const j = (await call(`/owner/v1/billing${ownerA}`, { token: tA })).json;
+  const inv2 = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 1 } });
+  await call(`/admin/v1/owners/${a.ownerId}/billing/settings`, { token: op, body: { exempt: false } });
+  return (s.returnCode === 'SUCCESS' && j.state === 'exempt' && j.options.length === 0 && inv2.status === 409) || { s, state: j.state, inv2 };
+});
+
+await check('оператор биш хүн гараар бүртгэж, үнэ өөрчилж ЧАДАХГҮЙ', async () => {
+  const r = await call(`/admin/v1/owners/${a.ownerId}/billing/extend`, { token: tA, body: { months: 12 } });
+  return r.status === 401 || `status ${r.status}`;
+});
+
+// ---- reminders -----------------------------------------------------------------------------------------
+await check('3 хоногийн өмнө SMS (холбоосгүй, латинаар) нэг удаа; хугацаа хэтэрвэл дахин нэг удаа', async () => {
+  await setPaidUntil(a.ownerId, "now() + interval '2 days'");
+  await query(`update public.owners set billing_notice_stage = null, billing_notice_for = null where id = $1`, [a.ownerId]);
+  const from = smsOut.length;
+  // The notices run on the hourly part of the sweep; a fresh process runs it on its first tick.
+  bridge.kill('SIGTERM');
+  await new Promise((r) => bridge.once('exit', r));
+  bridge = boot();
+  await waitUp();
+  const first = await until(() => smsOut.slice(from).some((m) => m.to === '99110081'), 6000);
+  const dueMsg = smsOut.slice(from).find((m) => m.to === '99110081')?.text ?? '';
+  await sleep(2500); // two more ticks: not hourly yet, and the stage is marked anyway
+  const sentOnce = smsOut.slice(from).filter((m) => m.to === '99110081').length === 1;
+  // Now past grace: one suspension notice.
+  await setPaidUntil(a.ownerId, "now() - interval '4 days'");
+  const from2 = smsOut.length;
+  bridge.kill('SIGTERM');
+  await new Promise((r) => bridge.once('exit', r));
+  bridge = boot();
+  await waitUp();
+  const second = await until(() => smsOut.slice(from2).some((m) => m.to === '99110081'), 6000);
+  const susMsg = smsOut.slice(from2).find((m) => m.to === '99110081')?.text ?? '';
+  return (first && sentOnce && second && /hugatsaa|duusna/i.test(dueMsg) && /zogsloo/i.test(susMsg) &&
+    !/https?:\/\//.test(dueMsg + susMsg)) || { first, sentOnce, second, dueMsg, susMsg };
+});
+
+bridge.kill('SIGTERM');
+await new Promise((r) => bridge.once('exit', r));
+for (const s of [jwks, qpayFake, smsFake, machine]) s.close();
+await close();
+
+const passed = results.filter(([ok]) => ok).length;
+for (const [ok, name, extra] of results) console.log(`  ${ok ? '✓' : '✗'} ${name}${extra}`);
+console.log(`\n  ${passed}/${results.length} давлаа`);
+if (passed !== results.length) console.log('\n--- bridge log (tail) ---\n' + bridge.logText.slice(-3000));
+process.exit(passed === results.length ? 0 : 1);
