@@ -441,7 +441,7 @@ from (values
 | `ALL /qpay/callback/:orderNo` | QPay | Хуучин хэлбэр, deploy-оос өмнөх нэхэмжлэхэд. IP-ээр хязгаарласан |
 | `GET /check/:deviceNo/:orderNo` | Та | Гараар баталгаажуулах (`DEBUG_KEY` заавал) |
 | `GET /orders/:orderNo` | Та | Захиалгын төлөв харах |
-| `GET /health` | Monitor | Нийтэд `{ok, push, db, house}`; debug түлхүүртэй бол бүрэн |
+| `GET /health` | Monitor | Нийтэд `{ok, push, db, house, build}` (`build` — deploy хийгдсэн commit); debug түлхүүртэй бол бүрэн |
 | `POST /guard/v1/attempt` | Portal | Нэвтрэх оролдлогын хязгаар (`GUARD_SECRET`) |
 | `ALL /qpay/billing/:invoiceId/:mac` | QPay | Системийн төлбөрийн callback, гарын үсэгтэй |
 

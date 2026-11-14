@@ -1230,10 +1230,22 @@ export async function ownerBilling(ownerId, { fee, graceDays, noticeDays }) {
 
 export async function billingHistory(ownerId, limit = 24) {
   const { rows } = await query(
-    `select id, source, months, amount_mnt, status, created_at, paid_at, period_from, period_to, note
+    `select id, source, months, amount_mnt, status, created_at, paid_at, period_from, period_to, note,
+            coalesce(method, case when source = 'qpay' then 'qpay' when amount_mnt = 0 then 'free' else 'other' end) as method
        from public.billing_invoices where owner_id = $1
       order by created_at desc limit $2`,
     [ownerId, limit]
+  );
+  return rows;
+}
+
+/** Every open QPay invoice of a business, whatever its age or merchant: what a manual payment supersedes. */
+export async function openBillingInvoices(ownerId) {
+  const { rows } = await query(
+    `select id, qpay_invoice_id, merchant from public.billing_invoices
+      where owner_id = $1 and source = 'qpay' and status = 'open' and qpay_invoice_id is not null
+      order by created_at`,
+    [ownerId]
   );
   return rows;
 }
@@ -1266,8 +1278,8 @@ export async function billingInvoicesLastHour(ownerId) {
 
 export const insertBillingInvoice = ({ ownerId, months, machines, feePerMachine, amount, createdBy, merchant }) =>
   one(
-    `insert into public.billing_invoices (owner_id, months, machines, fee_per_machine_mnt, amount_mnt, source, created_by, merchant)
-     values ($1, $2, $3, $4, $5, 'qpay', $6, $7) returning id`,
+    `insert into public.billing_invoices (owner_id, months, machines, fee_per_machine_mnt, amount_mnt, source, method, created_by, merchant)
+     values ($1, $2, $3, $4, $5, 'qpay', 'qpay', $6, $7) returning id`,
     [ownerId, months, machines, feePerMachine, amount, createdBy ?? null, merchant ?? null]
   );
 
@@ -1279,8 +1291,12 @@ export const attachBillingQpay = (id, { invoiceId, senderInvoiceNo, qrText, qrIm
     [id, invoiceId, senderInvoiceNo, qrText ?? null, qrImage ?? null, shortUrl ?? null, JSON.stringify(urls ?? [])]
   );
 
-export const cancelBillingInvoice = (id) =>
-  query(`update public.billing_invoices set status = 'cancelled' where id = $1 and status = 'open'`, [id]);
+export const cancelBillingInvoice = (id, reason = null) =>
+  query(
+    `update public.billing_invoices set status = 'cancelled', cancelled_at = now(), cancel_reason = $2
+      where id = $1 and status = 'open'`,
+    [id, reason]
+  );
 
 export const billingInvoice = (id) => one(`select * from public.billing_invoices where id = $1`, [id]);
 
@@ -1294,11 +1310,24 @@ export async function operatorBillingOverview(actorUserId, { fee, graceDays, not
   return rows;
 }
 
-export async function operatorBillingExtend(actorUserId, { ownerId, months, amount, feePerMachine, machines, note }) {
-  const { rows } = await query(`select * from app.operator_billing_extend($1, $2, $3, $4, $5, $6, $7)`, [
-    actorUserId, ownerId, months, amount, feePerMachine, machines, note ?? null,
+/** 021: cash, a transfer or free months, confirmed by the operator. */
+export async function operatorBillingRecord(actorUserId, { ownerId, months, amount, feePerMachine, machines, method, note }) {
+  const { rows } = await query(`select * from app.operator_billing_record($1, $2, $3, $4, $5, $6, $7, $8)`, [
+    actorUserId, ownerId, months, amount, feePerMachine, machines, method, note ?? null,
   ]);
-  return rows[0] ?? { out_status: 'error', out_paid_until: null };
+  return rows[0] ?? { out_status: 'error', out_paid_until: null, out_invoice_id: null };
+}
+
+/** 021: takes back the newest manual payment of a business. */
+export async function operatorBillingVoid(actorUserId, invoiceId, reason) {
+  const { rows } = await query(`select * from app.operator_billing_void($1, $2, $3)`, [actorUserId, invoiceId, reason ?? null]);
+  return rows[0] ?? { out_status: 'error', out_owner_id: null, out_paid_until: null };
+}
+
+/** 021: the ledger between two instants. */
+export async function operatorBillingPayments(actorUserId, from, to) {
+  const { rows } = await query(`select * from app.operator_billing_payments($1, $2, $3)`, [actorUserId, from, to]);
+  return rows;
 }
 
 export async function operatorBillingSettings(actorUserId, ownerId, { setFee, fee, setExempt, exempt }) {

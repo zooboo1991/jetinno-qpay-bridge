@@ -425,7 +425,14 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     return billing.billingFor(ownerId, { autoCheck: false, log });
   }));
 
-  /** Cash or a bank transfer, entered by the operator: the months are credited at once. */
+  /**
+   * A payment the operator confirms by hand — cash, a bank transfer — or
+   * months given free (021: `method` cash | bank | free | other). The months
+   * are credited at once. First every open QPay invoice of the business is
+   * voided at QPay, so its billing page cannot take the same money again;
+   * one that turns out to be paid is credited instead, and the cash is not
+   * recorded on top of it ('qpay_paid').
+   */
   router.post('/owners/:ownerId/billing/extend', json, handler('billing extend', async (req) => {
     const ownerId = uuidOrNull(req.params.ownerId);
     const months = Number(req.body?.months);
@@ -434,15 +441,47 @@ export function adminApi({ log = () => {}, portalOrigin = '' } = {}) {
     const b = await store.ownerBilling(ownerId, billing.BILLING);
     if (!b) return { status: 'not_found', paidUntil: null };
     const rawAmount = req.body?.amountMnt;
-    const amount = rawAmount === undefined || rawAmount === null || rawAmount === '' ? b.out_monthly_fee * months : Number(rawAmount);
-    if (!Number.isInteger(amount) || amount < 0) return { status: 'invalid', paidUntil: null };
-    const r = await store.operatorBillingExtend(req.operator.userId, {
-      ownerId, months, amount, feePerMachine: b.out_fee_per_machine, machines: b.out_machines,
+    const rawMethod = req.body?.method;
+    const method = rawMethod === undefined || rawMethod === null || rawMethod === '' ? null : String(rawMethod);
+    if (method !== null && !billing.METHODS.includes(method)) return { status: 'invalid', paidUntil: null };
+    const amount =
+      rawAmount === undefined || rawAmount === null || rawAmount === ''
+        ? method === 'free' ? 0 : b.out_monthly_fee * months
+        : Number(rawAmount);
+    // The SQL's bounds, checked before any open QPay invoice is voided below.
+    if (!Number.isInteger(amount) || amount < 0 || amount > 100_000_000) return { status: 'invalid', paidUntil: null };
+    // A console older than 021 sends no method: a 0₮ entry was free months.
+    const how = method ?? (amount === 0 ? 'free' : 'other');
+    if ((how === 'free') !== (amount === 0) && how !== 'other') return { status: 'invalid', paidUntil: null };
+
+    const open = await billing.supersedeOpenInvoices(ownerId, log);
+    if (open.paid) {
+      forgetOwner(ownerId);
+      const now = await store.ownerBilling(ownerId, billing.BILLING);
+      log('admin billing extend: paid by QPay meanwhile', ownerId);
+      return { status: 'qpay_paid', paidUntil: now?.out_paid_until ?? null };
+    }
+    const r = await store.operatorBillingRecord(req.operator.userId, {
+      ownerId, months, amount, feePerMachine: b.out_fee_per_machine, machines: b.out_machines, method: how,
       note: str(req.body?.note).trim().slice(0, 300),
     });
     if (r.out_status === 'ok') forgetOwner(ownerId);
-    log('admin billing extend', r.out_status, ownerId, String(months));
-    return { status: r.out_status, paidUntil: r.out_paid_until ?? null };
+    log('admin billing record', r.out_status, ownerId, `${months} сар`, how, `voided ${open.cancelled}`);
+    return { status: r.out_status, paidUntil: r.out_paid_until ?? null, invoiceId: r.out_invoice_id ?? null };
+  }));
+
+  /** 021: one month (Ulaanbaatar) of every business's invoices and payments, newest first, with sums. */
+  router.get('/billing/payments', handler('billing payments', async (req) =>
+    billing.ledger(req.operator.userId, typeof req.query.month === 'string' ? req.query.month : null)));
+
+  /** 021: takes back the newest manual payment of a business; paid-until returns to what it was. */
+  router.post('/billing/payments/:invoiceId/void', json, handler('billing void', async (req) => {
+    const invoiceId = uuidOrNull(req.params.invoiceId);
+    if (!invoiceId) return { status: 'not_found', paidUntil: null };
+    const r = await store.operatorBillingVoid(req.operator.userId, invoiceId, str(req.body?.reason).trim().slice(0, 300));
+    if (r.out_status === 'ok' && r.out_owner_id) forgetOwner(r.out_owner_id);
+    log('admin billing void', r.out_status, invoiceId);
+    return { status: r.out_status, paidUntil: r.out_status === 'ok' ? r.out_paid_until : null };
   }));
 
   /** The per-machine fee (null: the default) and the exemption; an absent field is left alone. */

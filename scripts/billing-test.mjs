@@ -12,6 +12,9 @@
  *     moment it pays — no cache in the way;
  *   - the operator's manual payment, fee override and exemption;
  *   - reminders once per stage, by SMS with no link;
+ *   - the operator's ledger (021): cash, transfer and free months by name,
+ *     open QPay invoices voided when a payment is confirmed by hand, and
+ *     only the newest manual payment taken back, to exactly where it was;
  *   - the house (020): with OPERATOR_MERCHANT_OWNER_ID set, the subscription
  *     and unregistered machines' sales go to that business's own QPay; what
  *     the env account issued before the switch is still checked there; a
@@ -68,6 +71,7 @@ const QPAY_PORT = 4642;
 const invoices = new Map(); // id -> { body, bearer }
 const paid = new Map(); // id -> amount
 const checks = []; // { id, bearer } — which merchant asked about which invoice
+const deletes = []; // invoice ids QPay was asked to void
 const qpayFake = createServer((req, res) => {
   let raw = '';
   req.on('data', (d) => (raw += d));
@@ -93,7 +97,16 @@ const qpayFake = createServer((req, res) => {
       const a = paid.get(j.object_id);
       return res.end(JSON.stringify({ rows: a !== undefined ? [{ payment_id: `p-${j.object_id}`, payment_status: 'PAID', payment_amount: a }] : [] }));
     }
-    if (req.method === 'DELETE') return res.end('{}');
+    if (req.method === 'DELETE') {
+      const id = decodeURIComponent(req.url.split('/').pop());
+      deletes.push(id);
+      // A paid invoice cannot be voided: QPay says so, and the bridge must credit it instead.
+      if (paid.has(id)) {
+        res.statusCode = 400;
+        return res.end(JSON.stringify({ error: 'INVOICE_PAID', message: 'INVOICE_PAID' }));
+      }
+      return res.end('{}');
+    }
     res.statusCode = 404;
     res.end('{}');
   });
@@ -369,6 +382,91 @@ await check('чөлөөлсөн бизнес хугацаа хэтэрсэн ч 
 await check('оператор биш хүн гараар бүртгэж, үнэ өөрчилж ЧАДАХГҮЙ', async () => {
   const r = await call(`/admin/v1/owners/${a.ownerId}/billing/extend`, { token: tA, body: { months: 12 } });
   return r.status === 401 || `status ${r.status}`;
+});
+
+// ---- the operator's ledger (021) ---------------------------------------------------------------------
+const extendB = (body) => call(`/admin/v1/owners/${b.ownerId}/billing/extend`, { token: op, body });
+const paidUntilOf = async (ownerId) => (await query(`select paid_until from public.owners where id = $1`, [ownerId])).rows[0].paid_until;
+let cashRow;
+let bankRow;
+await check('гараар баталгаажуулах: бэлэн, данс хэлбэрээр; буруу хослол (үнэгүй+дүн, бэлэн+0, тодорхойгүй хэлбэр) татгалзана', async () => {
+  const bad = [
+    await extendB({ months: 1, method: 'free', amountMnt: 5000 }),
+    await extendB({ months: 1, method: 'cash', amountMnt: 0 }),
+    await extendB({ months: 1, method: 'crypto' }),
+  ].map((r) => r.json?.status);
+  const cash = await extendB({ months: 1, method: 'cash' });
+  cashRow = cash.json?.invoiceId;
+  const bank = await extendB({ months: 1, method: 'bank', amountMnt: 30000, note: 'Хаан банк, гүйлгээ 12345' });
+  bankRow = bank.json?.invoiceId;
+  const rows = (await query(`select id, method, amount_mnt, prev_paid_until, period_from, period_to from public.billing_invoices where id = any($1)`, [[cashRow, bankRow]])).rows;
+  const c = rows.find((r) => r.id === cashRow);
+  const k = rows.find((r) => r.id === bankRow);
+  return (bad.every((s) => s === 'invalid') && cash.json?.status === 'ok' && bank.json?.status === 'ok' &&
+    c?.method === 'cash' && c.amount_mnt === 30000 && k?.method === 'bank' &&
+    k.prev_paid_until.getTime() === c.period_to.getTime()) || { bad, cash: cash.json, bank: bank.json, rows };
+});
+
+await check('«Төлбөр» жагсаалт: энэ сарын бүх төлбөр нэр, хэлбэр, бүртгэсэн хүнтэй; хэлбэрээр нийлбэр; зөвхөн сүүлийнх нь цуцлагдана', async () => {
+  const r = await call('/admin/v1/billing/payments', { token: op });
+  const j = r.json;
+  const bank = j?.payments?.find((p) => p.id === bankRow);
+  const cash = j?.payments?.find((p) => p.id === cashRow);
+  const qpayRow = j?.payments?.find((p) => p.method === 'qpay' && p.status === 'paid');
+  const old = await call('/admin/v1/billing/payments?month=2020-01', { token: op });
+  const sum = j?.payments?.filter((p) => p.status === 'paid').reduce((s, p) => s + p.amountMnt, 0);
+  return (r.status === 200 && /^\d{4}-\d{2}$/.test(j.month) && bank?.ownerName === 'Бусад ХХК' && bank.method === 'bank' &&
+    bank.recordedBy === 'Тест оператор' && bank.note === 'Хаан банк, гүйлгээ 12345' && bank.voidable === true &&
+    cash?.method === 'cash' && cash.voidable === false && qpayRow?.voidable === false && qpayRow.ownerName === 'Төлбөр ХХК' &&
+    j.totals.byMethod.bank.amountMnt >= 30000 && j.totals.byMethod.cash.count >= 1 && j.totals.paidMnt === sum &&
+    old.json?.month === '2020-01' && old.json.payments.length === 0) || { status: r.status, bank, cash, totals: j?.totals, old: old.json };
+});
+
+await check('цуцлах: сүүлийнх цуцлагдаж хугацаа яг өмнөх рүүгээ буцна, түүний өмнөх цуцлагдах боломжтой болно; давхар, QPay-ийнх, сүүлийнх биш нь татгалзана', async () => {
+  const cashEnd = (await query(`select period_to from public.billing_invoices where id = $1`, [cashRow])).rows[0].period_to;
+  const v = await call(`/admin/v1/billing/payments/${bankRow}/void`, { token: op, body: { reason: 'Буруу бизнест бүртгэсэн' } });
+  const after = await paidUntilOf(b.ownerId);
+  const again = await call(`/admin/v1/billing/payments/${bankRow}/void`, { token: op, body: {} });
+  const qpayId = (await query(`select id from public.billing_invoices where owner_id = $1 and source = 'qpay' and status = 'paid' limit 1`, [a.ownerId])).rows[0].id;
+  const notManual = await call(`/admin/v1/billing/payments/${qpayId}/void`, { token: op, body: {} });
+  const older = (await query(`select id from public.billing_invoices where owner_id = $1 and source = 'manual' and status = 'paid' and id <> $2 order by paid_at limit 1`, [b.ownerId, cashRow])).rows[0].id;
+  const notLatest = await call(`/admin/v1/billing/payments/${older}/void`, { token: op, body: {} });
+  const j = (await call('/admin/v1/billing/payments', { token: op })).json;
+  const bank = j.payments.find((p) => p.id === bankRow);
+  const cash = j.payments.find((p) => p.id === cashRow);
+  return (v.json?.status === 'ok' && after.getTime() === cashEnd.getTime() && new Date(v.json.paidUntil).getTime() === cashEnd.getTime() &&
+    again.json?.status === 'already' && notManual.json?.status === 'not_manual' && notLatest.json?.status === 'not_latest' &&
+    bank?.status === 'cancelled' && bank.cancelReason === 'Буруу бизнест бүртгэсэн' && bank.voidable === false && cash?.voidable === true &&
+    j.payments.filter((p) => p.status === 'paid').every((p) => p.id !== bankRow)) ||
+    { v: v.json, again: again.json, notManual: notManual.json, notLatest: notLatest.json, bank, cash, after, cashEnd };
+});
+
+await check('гараар баталгаажуулахад бизнесийн нээлттэй QPay нэхэмжлэх QPay дээр цуцлагдана; төлөгдсөн байвал QPay-ээр бүртгэгдэж, бэлэн давхар орохгүй', async () => {
+  const one = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 1 } });
+  const openId = one.json?.invoice?.id;
+  const openQ = (await query(`select qpay_invoice_id from public.billing_invoices where id = $1`, [openId])).rows[0]?.qpay_invoice_id;
+  const from = deletes.length;
+  const rec = await call(`/admin/v1/owners/${a.ownerId}/billing/extend`, { token: op, body: { months: 1, method: 'cash' } });
+  const voided = (await query(`select status, cancel_reason from public.billing_invoices where id = $1`, [openId])).rows[0];
+  // Now one QPay says is paid: the cash must not be recorded on top of it.
+  const three = await call(`/owner/v1/billing/invoices${ownerA}`, { token: tA, body: { months: 3 } });
+  const paidId = three.json?.invoice?.id;
+  const paidQ = (await query(`select qpay_invoice_id from public.billing_invoices where id = $1`, [paidId])).rows[0]?.qpay_invoice_id;
+  paid.set(paidQ, three.json?.invoice?.amountMnt);
+  const manualBefore = (await query(`select count(*)::int n from public.billing_invoices where owner_id = $1 and source = 'manual'`, [a.ownerId])).rows[0].n;
+  const rec2 = await call(`/admin/v1/owners/${a.ownerId}/billing/extend`, { token: op, body: { months: 1, method: 'cash' } });
+  const manualAfter = (await query(`select count(*)::int n from public.billing_invoices where owner_id = $1 and source = 'manual'`, [a.ownerId])).rows[0].n;
+  const credited = (await query(`select status from public.billing_invoices where id = $1`, [paidId])).rows[0];
+  return (rec.json?.status === 'ok' && deletes.slice(from).includes(openQ) && voided?.status === 'cancelled' && voided.cancel_reason &&
+    rec2.json?.status === 'qpay_paid' && credited?.status === 'paid' && manualAfter === manualBefore) ||
+    { rec: rec.json, voided, rec2: rec2.json, credited, manualBefore, manualAfter, deleted: deletes.slice(from) };
+});
+
+await check('оператор биш хүн «Төлбөр» жагсаалт харж, цуцалж ЧАДАХГҮЙ', async () => {
+  const list = await call('/admin/v1/billing/payments', { token: tA });
+  const v = await call(`/admin/v1/billing/payments/${cashRow}/void`, { token: tA, body: {} });
+  const row = (await query(`select status from public.billing_invoices where id = $1`, [cashRow])).rows[0];
+  return (list.status === 401 && v.status === 401 && row.status === 'paid') || { list: list.status, v: v.status, row };
 });
 
 // ---- reminders -----------------------------------------------------------------------------------------

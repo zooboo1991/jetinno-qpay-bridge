@@ -118,6 +118,7 @@ export async function billingFor(ownerId, { autoCheck = true, log = () => {} } =
     history: history.map((h) => ({
       id: h.id,
       source: h.source,
+      method: h.method,
       months: h.months,
       amountMnt: h.amount_mnt,
       status: h.status,
@@ -247,6 +248,98 @@ export async function checkInvoice(invoiceId, { log = () => {} } = {}) {
     ).catch(() => {});
   }
   return { status: 'paid', paidUntil: iso(r.out_paid_until), ownerId: row.owner_id };
+}
+
+/**
+ * Before the operator confirms a payment made outside QPay: every open QPay
+ * invoice of that business is voided at QPay, so the QR still on its billing
+ * page cannot take the same money a second time. One QPay says was paid
+ * after all is credited instead — and the caller does not record the cash
+ * on top of it. { paid, cancelled, failed }.
+ */
+export async function supersedeOpenInvoices(ownerId, log = () => {}) {
+  const out = { paid: 0, cancelled: 0, failed: 0 };
+  for (const inv of await store.openBillingInvoices(ownerId)) {
+    try {
+      const issuer = await house.issuerClient(inv.merchant);
+      if (issuer.error) {
+        out.failed += 1;
+        continue;
+      }
+      const r = await (issuer.client ?? qpay).cancelInvoice(inv.qpay_invoice_id);
+      if (r.paid) {
+        const c = await checkInvoice(inv.id, { log });
+        out[c.status === 'paid' ? 'paid' : 'failed'] += 1;
+      } else {
+        await store.cancelBillingInvoice(inv.id, 'гараар баталгаажуулсан төлбөр орлоо');
+        out.cancelled += 1;
+      }
+    } catch (err) {
+      out.failed += 1;
+      log('billing: open invoice not voided', inv.id, String(err?.message ?? err).split('\n')[0]);
+    }
+  }
+  return out;
+}
+
+export const METHODS = ['cash', 'bank', 'free', 'other'];
+
+/** "2026-11" → the instants that month starts and ends in Ulaanbaatar. */
+export function ubMonthRange(month) {
+  const m = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(String(month ?? ''));
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const from = new Date(Date.UTC(y, mo - 1, 1) - 8 * 3_600_000);
+  const to = new Date(Date.UTC(mo === 12 ? y + 1 : y, mo === 12 ? 0 : mo, 1) - 8 * 3_600_000);
+  return { month: `${m[1]}-${m[2]}`, from, to };
+}
+export const ubMonthNow = () => new Date(Date.now() + 8 * 3_600_000).toISOString().slice(0, 7);
+
+/** The console's «Төлбөр»: one month of every business's payments, and its sums. */
+export async function ledger(actorUserId, month) {
+  const range = ubMonthRange(month) ?? ubMonthRange(ubMonthNow());
+  const rows = await store.operatorBillingPayments(actorUserId, range.from, range.to);
+  const byMethod = Object.fromEntries(['qpay', ...METHODS].map((k) => [k, { count: 0, amountMnt: 0 }]));
+  let paidMnt = 0;
+  let paidCount = 0;
+  const payments = rows.map((r) => {
+    const amount = r.out_paid_amount_mnt ?? r.out_amount_mnt;
+    if (r.out_status === 'paid') {
+      paidMnt += amount;
+      paidCount += 1;
+      const m = byMethod[r.out_method] ?? byMethod.other;
+      m.count += 1;
+      m.amountMnt += amount;
+    }
+    return {
+      id: r.out_id,
+      ownerId: r.out_owner_id,
+      ownerName: r.out_owner_name,
+      source: r.out_source,
+      method: r.out_method,
+      status: r.out_status,
+      months: r.out_months,
+      machines: r.out_machines,
+      amountMnt: amount,
+      createdAt: iso(r.out_created_at),
+      paidAt: iso(r.out_paid_at),
+      periodFrom: iso(r.out_period_from),
+      periodTo: iso(r.out_period_to),
+      note: r.out_note ?? null,
+      recordedBy: r.out_recorded_by ?? null,
+      cancelledAt: iso(r.out_cancelled_at),
+      cancelReason: r.out_cancel_reason ?? null,
+      voidable: r.out_voidable === true,
+    };
+  });
+  return {
+    month: range.month,
+    from: range.from.toISOString(),
+    to: range.to.toISOString(),
+    totals: { paidMnt, paidCount, byMethod },
+    payments,
+  };
 }
 
 /** A date as an owner reads it: Ulaanbaatar's, YYYY-MM-DD. */

@@ -468,11 +468,11 @@ await check('машин refund хүсвэл ERROR буцааж, бүртгэл �
 });
 
 // ---- 11. public surface --------------------------------------------------------------------------
-await check('/health нийтэд зөвхөн {ok, push, db, house}; debug түлхүүртэй бол бүрэн', async () => {
+await check('/health нийтэд зөвхөн {ok, push, db, house, build}; debug түлхүүртэй бол бүрэн', async () => {
   const pub = await (await fetch(`http://localhost:${PORT}/health`)).json();
   const full = await (await fetch(`http://localhost:${PORT}/health`, { headers: { 'x-debug-key': DEBUG } })).json();
   // `house` is a state word (020), never an id.
-  return (Object.keys(pub).sort().join() === 'db,house,ok,push' && pub.house === 'unset' &&
+  return (Object.keys(pub).sort().join() === 'build,db,house,ok,push' && pub.house === 'unset' && pub.build === null &&
     'dwFailed' in full && 'ownerCache' in full) || { pub, full };
 });
 

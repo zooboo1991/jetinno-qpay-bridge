@@ -321,6 +321,7 @@ function notifyUrlAllowed(raw) {
  * many words that it is the operator's only merchant (a demo, one machine).
  */
 const ENV_MERCHANT_ONLY = process.env.ENV_MERCHANT_ONLY === '1';
+const BUILD = /^[0-9a-f]{7,40}$/i.test(process.env.RENDER_GIT_COMMIT ?? '') ? process.env.RENDER_GIT_COMMIT.slice(0, 7) : null;
 
 async function merchantFor(deviceNo, orderNo) {
   if (!DUAL_WRITE) {
@@ -1386,8 +1387,9 @@ app.get('/orders/:orderNo', (req, res) => {
 app.get('/health', (req, res) => {
   // `house`: which account takes the operator's money — 'unset' (the env
   // one), 'ok', or why the configured house cannot (house.js). A state word,
-  // never an id.
-  const pub = { ok: true, push: pushConfigured(), db: DUAL_WRITE, house: house.status() };
+  // never an id. `build`: the deployed commit (Render sets RENDER_GIT_COMMIT),
+  // so a deploy can be confirmed from outside; the repository is public.
+  const pub = { ok: true, push: pushConfigured(), db: DUAL_WRITE, house: house.status(), build: BUILD };
   if (!debugAllowed(req)) return res.json(pub);
   res.json({
     ...pub,
