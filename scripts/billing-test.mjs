@@ -11,7 +11,8 @@
  *   - a suspended business's machine refuses a sale, and sells again the
  *     moment it pays — no cache in the way;
  *   - the operator's manual payment, fee override and exemption;
- *   - reminders once per stage, by SMS with no link;
+ *   - reminders once per stage (three days before, the day it runs out,
+ *     the day the machines stop), by SMS with no link, never going back;
  *   - the operator's ledger (021): cash, transfer and free months by name,
  *     open QPay invoices voided when a payment is confirmed by hand, and
  *     only the newest manual payment taken back, to exactly where it was;
@@ -470,30 +471,72 @@ await check('оператор биш хүн «Төлбөр» жагсаалт х
 });
 
 // ---- reminders -----------------------------------------------------------------------------------------
-await check('3 хоногийн өмнө SMS (холбоосгүй, латинаар) нэг удаа; хугацаа хэтэрвэл дахин нэг удаа', async () => {
-  await setPaidUntil(a.ownerId, "now() + interval '2 days'");
-  await query(`update public.owners set billing_notice_stage = null, billing_notice_for = null where id = $1`, [a.ownerId]);
-  const from = smsOut.length;
+const restartForNotices = async () => {
   // The notices run on the hourly part of the sweep; a fresh process runs it on its first tick.
   bridge.kill('SIGTERM');
   await new Promise((r) => bridge.once('exit', r));
   bridge = boot();
   await waitUp();
-  const first = await until(() => smsOut.slice(from).some((m) => m.to === '99110081'), 6000);
-  const dueMsg = smsOut.slice(from).find((m) => m.to === '99110081')?.text ?? '';
+};
+const smsTo = (from, phone) => smsOut.slice(from).filter((m) => m.to === phone);
+await check('сануулга: 3 хоногийн өмнө, хугацаа дуусах өдөр («...-нд зогсооно»), зогсох өдөр — тус бүр нэг SMS, холбоосгүй, латинаар', async () => {
+  await setPaidUntil(a.ownerId, "now() + interval '2 days'");
+  await query(`update public.owners set billing_notice_stage = null, billing_notice_for = null where id = $1`, [a.ownerId]);
+  const from = smsOut.length;
+  await restartForNotices();
+  const first = await until(() => smsTo(from, '99110081').length > 0, 6000);
+  const dueMsg = smsTo(from, '99110081')[0]?.text ?? '';
   await sleep(2500); // two more ticks: not hourly yet, and the stage is marked anyway
-  const sentOnce = smsOut.slice(from).filter((m) => m.to === '99110081').length === 1;
-  // Now past grace: one suspension notice.
-  await setPaidUntil(a.ownerId, "now() - interval '4 days'");
+  const sentOnce = smsTo(from, '99110081').length === 1;
+  // The day it runs out (inside the grace days): the machines stop on the grace date.
+  await setPaidUntil(a.ownerId, "now() - interval '1 day'");
+  const graceDay = (await query(
+    `select to_char((paid_until + interval '3 days') at time zone 'Asia/Ulaanbaatar', 'YYYY-MM-DD') d from public.owners where id = $1`,
+    [a.ownerId])).rows[0].d;
   const from2 = smsOut.length;
-  bridge.kill('SIGTERM');
-  await new Promise((r) => bridge.once('exit', r));
-  bridge = boot();
-  await waitUp();
-  const second = await until(() => smsOut.slice(from2).some((m) => m.to === '99110081'), 6000);
-  const susMsg = smsOut.slice(from2).find((m) => m.to === '99110081')?.text ?? '';
-  return (first && sentOnce && second && /hugatsaa|duusna/i.test(dueMsg) && /zogsloo/i.test(susMsg) &&
-    !/https?:\/\//.test(dueMsg + susMsg)) || { first, sentOnce, second, dueMsg, susMsg };
+  await restartForNotices();
+  const second = await until(() => smsTo(from2, '99110081').length > 0, 6000);
+  const overMsg = smsTo(from2, '99110081')[0]?.text ?? '';
+  // The same day again: nothing more.
+  const from3 = smsOut.length;
+  await restartForNotices();
+  await sleep(2500);
+  const quiet = smsTo(from3, '99110081').length === 0;
+  // Past grace: one suspension notice.
+  await setPaidUntil(a.ownerId, "now() - interval '4 days'");
+  const from4 = smsOut.length;
+  await restartForNotices();
+  const third = await until(() => smsTo(from4, '99110081').length > 0, 6000);
+  const susMsg = smsTo(from4, '99110081')[0]?.text ?? '';
+  return (first && sentOnce && second && quiet && third &&
+    /hugatsaa|duusna/i.test(dueMsg) &&
+    /duuslaa/i.test(overMsg) && overMsg.includes(graceDay) && /zogsoono/i.test(overMsg) &&
+    /zogsloo/i.test(susMsg) && !/https?:\/\//.test(dueMsg + overMsg + susMsg) &&
+    // Plain ASCII: the gateway mangles anything else (and it costs a UCS-2 segment).
+    /^[\x20-\x7E]*$/.test(dueMsg + overMsg + susMsg) && dueMsg.includes(' tug)') && overMsg.includes('"Tulbur"')) ||
+    { first, sentOnce, second, quiet, third, graceDay, dueMsg, overMsg, susMsg };
+});
+
+await check('сануулга буцаж явахгүй: дууссаныг хэлсний дараа «дуусна» дахин үгүй; алгассан шатыг биш, одоогийн шатыг л хэлнэ', async () => {
+  const due = async (sql, stage) => {
+    await query(`update public.owners set paid_until = ${sql}, billing_notice_stage = $2,
+                   billing_notice_for = case when $2::text is null then null else ${sql} end where id = $1`, [a.ownerId, stage]);
+    // Pinned to one instant, so paid_until and billing_notice_for are the same value.
+    await query(`update public.owners set billing_notice_for = paid_until where id = $1 and billing_notice_stage is not null`, [a.ownerId]);
+    const r = await query(`select out_stage from app.billing_notices_due(30000, 3, 3) where out_owner_id = $1`, [a.ownerId]);
+    return r.rows[0]?.out_stage ?? 'none';
+  };
+  const got = {
+    overdueAfterDueSoon: await due("now() - interval '1 day'", 'due_soon'),
+    overdueAgain: await due("now() - interval '1 day'", 'overdue'),
+    overdueFirst: await due("now() - interval '1 day'", null),
+    suspendedAfterOverdue: await due("now() - interval '4 days'", 'overdue'),
+    suspendedAgain: await due("now() - interval '4 days'", 'suspended'),
+    suspendedFirst: await due("now() - interval '4 days'", null),
+  };
+  const want = { overdueAfterDueSoon: 'overdue', overdueAgain: 'none', overdueFirst: 'overdue',
+    suspendedAfterOverdue: 'suspended', suspendedAgain: 'none', suspendedFirst: 'suspended' };
+  return Object.keys(want).every((k) => got[k] === want[k]) || got;
 });
 
 // ---- the house: the operator's money on a business's own QPay (020) ----------------------------------

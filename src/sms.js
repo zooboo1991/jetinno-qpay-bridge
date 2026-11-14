@@ -56,9 +56,21 @@ const CYRILLIC = {
   ш: 'sh', щ: 'sh', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
 };
 
+/*
+ * Outside Cyrillic the same gateway gets anything that is not plain ASCII:
+ * guillemets, typographic dashes and quotes, the tögrög sign. Each becomes
+ * its ASCII cousin — which also keeps a message in GSM-7, 160 characters a
+ * segment, where one such character makes it UCS-2 at 70.
+ */
+const PUNCT = {
+  '«': '"', '»': '"', '“': '"', '”': '"', '„': '"', '‘': "'", '’': "'",
+  '—': '-', '–': '-', '…': '...', '№': 'No', '\u00a0': ' ',
+};
+
 export function toLatin(text) {
-  return [...text]
+  return [...String(text).replace(/(\d)\s?₮/g, '$1 tug').replace(/₮/g, 'tug')]
     .map((ch) => {
+      if (PUNCT[ch] !== undefined) return PUNCT[ch];
       const lower = ch.toLowerCase();
       const mapped = CYRILLIC[lower];
       if (mapped === undefined) return ch;

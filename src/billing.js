@@ -350,19 +350,28 @@ export function ubDate(d) {
 const mnt = (n) => `${Math.round(Number(n) || 0).toLocaleString('en-US')}₮`;
 
 /**
- * Reminders, from the sweep: three days before paid_until, and at
- * suspension. Once per stage per period; a payment starts the next period.
- * No link in the SMS, ever — the same rule as every message this system
- * sends an owner.
+ * Reminders, from the sweep, by push and SMS:
+ *   due_soon  — BILLING_NOTICE_DAYS before paid_until;
+ *   overdue   — the day it runs out: the machines stop on <grace date> (022);
+ *   suspended — the day they stop.
+ * Once per stage per period, never going back to an earlier one; a payment
+ * starts the next period. No link in the SMS, ever — the same rule as every
+ * message this system sends an owner.
  */
+export function noticeText(n) {
+  if (n.out_stage === 'suspended') {
+    return 'Coffeine: Системийн төлбөр төлөгдөөгүй тул машин QPay-ээр зарахаа зогслоо. Самбарын «Төлбөр» хэсгээс төлөхөд шууд сэргэнэ.';
+  }
+  if (n.out_stage === 'overdue') {
+    return `Coffeine: Системийн төлбөрийн хугацаа дууслаа. ${ubDate(n.out_grace_until)}-нд машин QPay-ээр зарахаа зогсооно. Самбарын «Төлбөр» хэсгээс төлнө үү.`;
+  }
+  return `Coffeine: Системийн төлбөр ${ubDate(n.out_paid_until)}-нд дуусна (сард ${mnt(n.out_monthly_fee)}). Самбарын «Төлбөр» хэсгээс QPay-ээр төлнө үү.`;
+}
+
 export async function sendBillingNotices(log = () => {}) {
   const due = await store.billingNoticesDue(BILLING);
   for (const n of due) {
-    const until = ubDate(n.out_paid_until);
-    const text =
-      n.out_stage === 'suspended'
-        ? 'Coffeine: Системийн төлбөр төлөгдөөгүй тул машин QPay-ээр зарахаа зогслоо. Самбарын «Төлбөр» хэсгээс төлөхөд шууд сэргэнэ.'
-        : `Coffeine: Системийн төлбөр ${until}-нд дуусна (сард ${mnt(n.out_monthly_fee)}). Самбарын «Төлбөр» хэсгээс QPay-ээр төлнө үү.`;
+    const text = noticeText(n);
     await pushToOwners(
       [n.out_owner_id],
       { title: 'Системийн төлбөр', body: text.replace(/^Coffeine: /, ''), url: '/billing', tag: 'billing' },
